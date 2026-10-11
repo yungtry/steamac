@@ -16,10 +16,11 @@ the session never authenticates. The patched FEX passes the `ptrace` and signal-
 | 0011–0020 | kernel-fidelity gaps a title or Wine can observe (debug registers, `/proc/<pid>/status`, `arch_prctl`, regsets, `restart_syscall`, the signal frame) |
 | 0022, 0023, 0025, 0026 | what a second title's anti-tamper bootstrapper observes: host stack per SIGSYS trap, reads of FEX's own shadow-stack guard pages, the single-step trap after `iretq`, a thread exiting on its signal alt stack |
 | 0027 | `/proc/<pid>/maps` of a FEX tracee without FEX's host-only mappings: the current EAC launcher module finds `libc.so.6` there by name before the guest's libc is loaded, and without 0027 it called into FEX's aarch64 libc and failed with `Unexpected error. (#1)` |
+| 0028 | code pages the guest mprotects from executable to writable-and-executable become SMC-hot (the JIT verifies them) instead of staying write-protected on the host: another process's write (wineserver's `process_vm_writev` for `NtWriteVirtualMemory`) hit the host's read-only page and failed with `EFAULT`, so The Division 2's protector reported `Error at hooking API NtProtectVirtualMemory` and the game exited with no window |
 | 0003, 0005, 0006, 0009, 0024 | accounting and profiling only |
 
 Required for VRChat: 0001, 0002 and 0007/0008; with the EAC launcher module served since 2026-10-11 (seen with Goose Goose Duck), also 0027. 0004 is performance; 0003, 0005, 0006, 0009 and 0024 are accounting and profiling only.
-`build-fex.sh` applies every patch in `patches/` (0001–0027) and pins base commit `14c92681`; a tree built from an older, shorter series gets only the patches it lacks. Patch 0021 (`pop r/m`) was withdrawn — it broke the normal path and hung the EAC launcher; see `patches/withdrawn/`.
+`build-fex.sh` applies every patch in `patches/` (0001–0028) and pins base commit `14c92681`; a tree built from an older, shorter series gets only the patches it lacks. Patch 0021 (`pop r/m`) was withdrawn — it broke the normal path and hung the EAC launcher; see `patches/withdrawn/`.
 
 **Scope.** These patches do not try to make FEX a replica of native x86-64 Linux. Like upstream FEX, they make a
 behaviour exact only where real software observes it (the anti-cheat launcher, Wine, a title's own probes) and keep it
