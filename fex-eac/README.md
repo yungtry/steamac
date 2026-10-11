@@ -18,6 +18,8 @@ the session never authenticates. The patched FEX passes the `ptrace` and signal-
 | 0022, 0023, 0025, 0026 | what a second title's anti-tamper bootstrapper observes: host stack per SIGSYS trap, reads of FEX's own shadow-stack guard pages, the single-step trap after `iretq`, a thread exiting on its signal alt stack |
 | 0033 | `/proc/<pid>/maps` lists only the emulated process's mappings (a launcher module that picks a library from its child's maps otherwise picks an AArch64 host library and fails with `210`) |
 | 0035 | code pages the guest makes writable stay writable for other processes (a second process' write to shared code no longer faults forever; from yungtry's patch 0028, consumer The Division 2) |
+| 0029 (downstream) | `rt_sigreturn` gives the interrupted code back its `InSyscallInfo` (the "registers already spilled" mask): the guest's `rt_sigreturn` is itself a syscall that sets it to `0xFFFF`, and a handler that left EIP alone resumed the JIT block with that stale value, so the next signal or SMC re-execution spilled no registers and restored stale ones. Ubisoft Connect's protector sends each thread a SIGUSR1 every few ms; its TLS thread then crashed in nettle/hogweed (`Certificate verification ... failed`, `schan_DecryptMessage` `c0000005`) and the launcher stayed at "Looking for patches" |
+| 0030 (downstream) | a FEX tracee's host `SIGBUS` stops for unaligned atomics (`BUS_ADRALN`, which FEX emulates in its own handler on arm64) are hidden from the tracer, like FEX's own `SIGTRAP`/`SIGSEGV` stops. The EAC client initialising in The Division 2's game process showed its launcher 1000 such stops, and the launcher gave up with `Unexpected error. (#2)` |
 | 0003, 0005, 0006, 0009, 0024 | accounting and profiling only |
 
 Required for VRChat: 0001, 0002 and 0007/0008. 0004 is performance; 0003, 0005, 0006, 0009 and 0024 are accounting and profiling only.
@@ -29,6 +31,11 @@ the normal path and hung the EAC launcher.
 
 **Downstream forks.** FEX patches now come from StonkGuy/FEX tag `eac-2610.2` instead of `fex-eac/patches/`. A
 downstream 0027 (`/proc/<pid>/maps` for a tracer) corresponds to our 0033.
+
+**Downstream patches in this fork.** `fex-eac/patches/` holds 0029 and 0030, which are not in StonkGuy/FEX yet;
+`build-fex.sh` applies them with `git am` on top of tag `eac-2610.2`, and a re-run applies only the ones the tree
+lacks. The older downstream 0027 and 0028 are upstream as 0033 and 0035 and are no longer carried. Games that need
+0029/0030 are listed in [compatibility.md](compatibility.md).
 
 **Scope.** These patches do not try to make FEX a replica of native x86-64 Linux. Like upstream FEX, they make a
 behaviour exact only where real software observes it (the anti-cheat launcher, Wine, a title's own probes) and keep it

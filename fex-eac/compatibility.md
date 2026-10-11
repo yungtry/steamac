@@ -6,7 +6,7 @@ Games tested with the patched FEX in the SteamOS guest (see [README.md](README.m
 |---|---|---|
 | Goose Goose Duck | works | everything works |
 | Halo: The Master Chief Collection | works | on loading into a map it may hitch at first while shaders are cached |
-| The Division 2 | fails | gets past EAC, then hangs at VMProtect / Ubisoft Connect |
+| The Division 2 | works | reached the world (2026-10-11), with patches 0029 (Ubisoft Connect) and 0030 (EAC launcher). Needs `EAC_LAUNCHERDIR` (compatdata `2221490`) and `PROTON_EAC_RUNTIME` in the launch options, as in [README.md](README.md#3-vrchat-launch-options) |
 | Halo Infinite | doesn't work | compiling shaders takes a long time; blockers in [Halo Infinite](#halo-infinite) |
 
 ## Halo Infinite

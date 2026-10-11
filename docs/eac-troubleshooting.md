@@ -15,6 +15,8 @@ Never attach a debugger, `strace` or `perf` to the running game: EAC reports it.
 |---|---|
 | launcher stops at `Starting Wine module mapping`, or the result is not `301` | the patched FEX is probably not installed: `sh install-fex-tool.sh status`. Valve's FEX-2607 fails EAC ([eac-how-it-works.md](eac-how-it-works.md)) |
 | `210 'Unexpected error. (#1)'` about 3 s after `Starting Wine module mapping` | the installed FEX predates patch 0033: re-run `sh build-fex.sh` and `sh install-fex-tool.sh` |
+| `Starting Wine module mapping`, then `Launcher finished with: 210, 'Unexpected error. (#2) (0)'` under a second later; the Proton log may also show `EACLaunch.exe` crashing (`page fault on read access to 0xfffffffffffffffa`) | the FEX build predates patch 0030: the launcher's ptrace view showed it FEX's own `SIGBUS` stops for unaligned atomics in the game process, and it gave up after 1000. Re-run `sh build-fex.sh` and `sh install-fex-tool.sh` |
+| Ubisoft Connect (The Division 2) stays at "Looking for patches"; its `launcher_log.txt` shows `Certificate verification ... failed`, or the Proton log shows `schan_DecryptMessage Returning c0000005` / a `handle_syscall_fault` in `libnettle.so.8` or `libhogweed` | the FEX build predates patch 0029: re-run `sh build-fex.sh` and `sh install-fex-tool.sh` |
 | worked before, fails after a Steam update | the update replaced the FEX tool with Valve's build; re-run `sh install-fex-tool.sh` |
 | the Android build starts (or the game does not use Proton) | set the game's compatibility tool to Proton Experimental and let Steam install the Windows depot |
 | EAC runtime errors at start | install **Proton EasyAntiCheat Runtime** (1826330) and check `EAC_LAUNCHERDIR` / `PROTON_EAC_RUNTIME` in the launch options |
