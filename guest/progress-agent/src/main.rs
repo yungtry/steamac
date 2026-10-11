@@ -11,6 +11,9 @@
 //!   log <text>                    detail line ("583 / 662 MB · 12.4 MB/s")
 //!   ready                         Steam UI (Desktop Mode: the desktop) is on screen
 //!   shutdown <poweroff|reboot>    session torn down by a system shutdown
+//!   game-size <w>x<h>             size of the focused game's window (after `focus game`, and
+//!                                 when it changes): the host shows the game at its own size
+//!                                 when "Upscale lower game resolutions" is on (focus.rs)
 //!   game <appid> <name>           display name from the appmanifest, once per app id and
 //!                                 boot, right after its first `focus game <appid>`
 //!   focus steam | focus game <appid> | focus desktop [<w>x<h>]   gamescope's focused app

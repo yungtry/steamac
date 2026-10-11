@@ -59,13 +59,17 @@ final class Presenter: DisplaySink {
         os_unfair_lock_unlock(&lock)
         guard let f = scanout.take() else { return }
         let perf = PerfStats.shared
-        let flushedAt = perf?.frameTaken() ?? 0
+        var stamp = perf?.frameTaken() ?? PerfStats.FrameStamp()
         let t0 = perf != nil ? CACurrentMediaTime() : 0
         renderer.upload(f)
-        if let perf { perf.uploaded(ms: (CACurrentMediaTime() - t0) * 1000) }
+        if let perf {
+            let ms = (CACurrentMediaTime() - t0) * 1000
+            perf.uploaded(ms: ms)
+            stamp.uploadMs = ms
+        }
         scanout.release(f)
         framesShown &+= 1
-        view?.redraw(flushedAt: flushedAt)
+        view?.redraw(stamp: stamp)
         if let next = onNextFrame {
             onNextFrame = nil
             next()
@@ -101,7 +105,7 @@ final class VMView: NSView {
             self.hudAttached = true
             // "default" first, so that "off" is a change.
             self.metalLayer.developerHUDProperties = ["mode": "default"]
-            if !self.metalHUD { self.metalLayer.developerHUDProperties = ["mode": "off"] }
+            Self.applyHUD(self.metalHUD, gameVisible: self.gameLayersVisible, main: self.metalLayer, mainAttached: true)
         }
     }
 
@@ -145,16 +149,48 @@ final class VMView: NSView {
         }
     }
 
-    /// `flushedAt`: the guest flush time of a new frame (perf stats), 0 for a plain redraw.
-    func redraw(flushedAt: CFTimeInterval = 0) { renderer.draw(to: metalLayer, flushedAt: flushedAt) }
+    /// `stamp`: the guest flush of a new frame (perf stats), empty for a plain redraw.
+    func redraw(stamp: PerfStats.FrameStamp = .init()) { renderer.draw(to: metalLayer, stamp: stamp) }
 
-    /// Metal Performance HUD shown (WindowController). libMTLHud attaches to the layer once a
+    /// Layers that other code adds on top of the guest picture (the remoted game's own CAMetalLayer,
+    /// wmtr with WMTR_PRESENT=overlay) are shown only while a game has the guest's focus, so the Steam
+    /// UI or the desktop stays visible when the game is in the background. Read by the presenter (KVC)
+    /// for layers added later.
+    @objc dynamic var gameLayersVisible = false {
+        didSet {
+            Self.applyGameLayers(visible: gameLayersVisible, in: metalLayer)
+            Self.applyHUD(metalHUD, gameVisible: gameLayersVisible, main: metalLayer, mainAttached: hudAttached)
+        }
+    }
+
+    static func applyGameLayers(visible: Bool, in parent: CALayer) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for l in parent.sublayers ?? [] where l is CAMetalLayer { l.isHidden = !visible }
+        CATransaction.commit()
+    }
+
+    /// Metal Performance HUD shown (WindowController). libMTLHud attaches to a layer once a
     /// drawable has reached the screen, starts shown (MTL_HUD_ENABLED) and then acts only on
-    /// changes of developerHUDProperties["mode"]; the setting applies from then on.
-    var metalHUD = false {
-        didSet { if hudAttached { metalLayer.developerHUDProperties = ["mode": metalHUD ? "default" : "off"] } }
+    /// changes of developerHUDProperties["mode"]; the setting applies from then on. Read by the
+    /// presenter (KVC) for game layers added later.
+    @objc dynamic var metalHUD = false {
+        didSet { Self.applyHUD(metalHUD, gameVisible: gameLayersVisible, main: metalLayer, mainAttached: hudAttached) }
     }
     private var hudAttached = false
+
+    /// One HUD at a time: on the game layer (the lean path's remoted CAMetalLayer) while it is shown,
+    /// else on the guest picture. Game layers get "default" before the wanted mode, so that "off" is a
+    /// change for a HUD that attached showing; a game layer is visible here only after it presented.
+    static func applyHUD(_ on: Bool, gameVisible: Bool, main: CAMetalLayer, mainAttached: Bool) {
+        let game = (main.sublayers ?? []).compactMap { $0 as? CAMetalLayer }
+        let onGame = on && gameVisible && !game.isEmpty
+        if mainAttached { main.developerHUDProperties = ["mode": on && !onGame ? "default" : "off"] }
+        for l in game {
+            l.developerHUDProperties = ["mode": "default"]
+            if !onGame { l.developerHUDProperties = ["mode": "off"] }
+        }
+    }
 
     /// The guest picture's rect in view points (same fit as the renderer).
     var fitRect: CGRect {
@@ -171,4 +207,11 @@ final class VMView: NSView {
         let uy = 1 - Double((p.y - f.minY) / f.height)   // AppKit views are bottom-left origin
         return (min(1, max(0, ux)), min(1, max(0, uy)))
     }
+}
+
+/// Host-side pointer input setup for the VM process.
+enum PointerInput {
+    /// Deliver every mouse move as it comes instead of coalescing moves into one per display frame:
+    /// up to a refresh of latency taken off pointer motion (the guest gets relative input either way).
+    static func configure() { NSEvent.isMouseCoalescingEnabled = false }
 }

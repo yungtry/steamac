@@ -2,12 +2,14 @@
 # Assemble work/out/FX Steam Launcher.app (called by build.sh with the freshly built binary):
 #   Contents/MacOS/steamac-vm           launcher, rpath @executable_path/../Frameworks only
 #   Contents/Frameworks/*.dylib         libkrun, libvirglrenderer, libMoltenVK, libvulkan_kosmickrisp
-#                                       (when built: host/kosmickrisp, macOS 26+) + their non-system
+#                                       (when built: host/kosmickrisp, macOS 26+), libwmtr_host (when
+#                                       built: wmtr/, the DXMT graphics path) + their non-system
 #                                       dependencies (libepoxy), install names @rpath/<name>
 #   Contents/Resources/                 gvproxy, Image, initramfs.cpio.gz, steamac-layer.img,
 #                                       desync + steamdeck-images.pem (Valve RAUC CA) for
 #                                       "Create New Disk…", generated licenses/ notices,
-#                                       Assets.car + AppIcon.icns (app icon, see below)
+#                                       Assets.car + AppIcon.icns (app icon, see below),
+#                                       <lang>.lproj (string catalogs compiled by build.sh)
 # The SteamOS disk is not bundled (Settings > Advanced "Disk image" / "Create New Disk…"). Ad-hoc
 # signed with the hypervisor + disable-library-validation entitlements. Built in a temp dir,
 # then moved in place.
@@ -87,6 +89,8 @@ copy_lib() {
 # MoltenVK always, KosmicKrisp when it was built (macOS 26+ build hosts).
 libs=(libkrun.1.dylib libvirglrenderer.1.dylib libMoltenVK.dylib)
 [[ -f "$KRUN_PREFIX/lib/libvulkan_kosmickrisp.dylib" ]] && libs+=(libvulkan_kosmickrisp.dylib)
+# libkrun dlopens the wmtr host (Settings > Advanced "Graphics path: DXMT", STEAMAC_WMTR_LIB) when built.
+[[ -f "$KRUN_PREFIX/lib/libwmtr_host.dylib" ]] && libs+=(libwmtr_host.dylib)
 for lib in "${libs[@]}"; do
     copy_lib "$KRUN_PREFIX/lib/$lib"
 done
@@ -113,6 +117,10 @@ chmod 755 "$TMP/Contents/Resources/gvproxy" "$TMP/Contents/Resources/desync"
 cp "$ROOT/scripts/keys/steamdeck-images.pem" "$TMP/Contents/Resources/steamdeck-images.pem"
 mkdir -p "$TMP/Contents/Resources/licenses"
 cp -R "$OUT/licenses/." "$TMP/Contents/Resources/licenses/"
+for lproj in "$HERE/.build/l10n"/*.lproj; do
+    [[ -d $lproj ]] || { echo "bundle.sh: warning: no compiled localizations in $HERE/.build/l10n (built without Xcode); English only" >&2; break; }
+    cp -R "$lproj" "$TMP/Contents/Resources/"
+done
 
 # App icon: AppIcon.icon (Icon Composer document) compiled by Xcode 26's actool into Assets.car
 # (layered Liquid Glass icon for macOS 26, pre-rendered squircle renditions for macOS 15) and an

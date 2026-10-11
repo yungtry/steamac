@@ -1,0 +1,66 @@
+#!/bin/bash
+# Proton-lean (Steam compatibility tool, chosen once per game): Proton Experimental with the graphics path
+# the launcher selected (Settings > Advanced "Graphics path", kernel command line steamac.gfx=):
+#   dxmt    Proton Experimental's files hard-linked into an overlay whose D3D11/DXGI dlls are DXMT's and
+#           whose unixlib winemetal.so remotes Metal to the Mac (wmtr); the game's own prefix gets DXMT's
+#           dlls and winemetal.dll (marker pfx/.steamac-gfx)
+#   vulkan  plain Proton Experimental (DXVK); a prefix that last ran DXMT gets Proton's DXVK dlls back
+# Experimental's own files are never modified. Everything else (EAC runtime, launch options) passes
+# through unchanged. Env for tests: LEAN_DIR (DXMT files), PROTON_EXPERIMENTAL, LEAN_CMDLINE, LEAN_STATE.
+set -u
+LEAN=${LEAN_DIR:-/usr/lib/steamac/lean}
+STATE=${LEAN_STATE:-$HOME/.local/share/steamac}
+log() { echo "proton-lean: $*" >&2; }
+
+exp=${PROTON_EXPERIMENTAL:-}
+if [ -z "$exp" ]; then
+  IFS=: read -r -a paths <<< "${STEAM_COMPAT_TOOL_PATHS:-}"
+  for p in "${paths[@]}"; do case "$p" in *"/Proton - Experimental") exp=$p ;; esac; done
+  [ -n "$exp" ] || exp="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental"
+fi
+[ -x "$exp/proton" ] || { log "Proton Experimental not found ($exp)"; exit 1; }
+
+mode=vulkan
+for w in $(cat "${LEAN_CMDLINE:-/proc/cmdline}" 2>/dev/null); do case $w in steamac.gfx=dxmt) mode=dxmt ;; esac; done
+if [ "$mode" = dxmt ] && [ ! -f "$LEAN/x86_64-unix/winemetal.so" ]; then log "no DXMT files in $LEAN; using Vulkan"; mode=vulkan; fi
+
+pfx=${STEAM_COMPAT_DATA_PATH:+$STEAM_COMPAT_DATA_PATH/pfx}
+sys=${pfx:+$pfx/drive_c/windows/system32}
+dlls="d3d11.dll dxgi.dll d3d10core.dll"
+
+if [ "$mode" = vulkan ]; then
+  if [ -n "$pfx" ] && [ "$(cat "$pfx/.steamac-gfx" 2>/dev/null)" = dxmt ]; then
+    for f in $dlls; do cp -f "$exp/files/lib/wine/dxvk/x86_64-windows/$f" "$sys/$f"; done
+    rm -f "$sys/winemetal.dll" "$pfx/.steamac-gfx"
+    log "prefix back on DXVK"
+  fi
+  exec "$exp/proton" "$@"
+fi
+
+# overlay, rebuilt when Experimental or the DXMT files change
+key=$( { cat "$exp/version" 2>/dev/null; cksum "$LEAN"/x86_64-windows/*.dll "$LEAN/x86_64-unix/winemetal.so"; } | cksum | cut -d' ' -f1)
+ov=$STATE/proton-lean-base
+if [ "$(cat "$ov/.lean-key" 2>/dev/null)" != "$key" ]; then
+  rm -rf "$ov.new"; mkdir -p "$STATE"
+  cp -al "$exp" "$ov.new" || { log "cannot build $ov"; exec "$exp/proton" "$@"; }
+  W=$ov.new/files/lib/wine
+  for f in $dlls winemetal.dll; do rm -f "$W/x86_64-windows/$f"; cp "$LEAN/x86_64-windows/$f" "$W/x86_64-windows/$f"; done
+  # what proton installs into prefixes instead of wine's builtins: DXMT, loaded native-only, so without
+  # the "Wine builtin DLL" marker (16 bytes at 0x40); winemetal.dll keeps it (a unixlib)
+  for f in $dlls; do
+    rm -f "$W/dxvk/x86_64-windows/$f"; cp "$LEAN/x86_64-windows/$f" "$W/dxvk/x86_64-windows/$f"
+    dd if=/dev/zero of="$W/dxvk/x86_64-windows/$f" bs=1 seek=64 count=16 conv=notrunc status=none
+  done
+  rm -f "$W/x86_64-unix/winemetal.so"; cp "$LEAN/x86_64-unix/winemetal.so" "$W/x86_64-unix/winemetal.so"
+  echo "$key" > "$ov.new/.lean-key"
+  rm -rf "$ov"; mv "$ov.new" "$ov"
+  log "overlay built ($ov)"
+fi
+# the prefix (once proton has created it): DXMT's dlls and winemetal.dll, every start
+if [ -n "$sys" ] && [ -d "$sys" ]; then
+  W=$ov/files/lib/wine
+  for f in $dlls; do cmp -s "$W/dxvk/x86_64-windows/$f" "$sys/$f" || cp -f "$W/dxvk/x86_64-windows/$f" "$sys/$f"; done
+  cmp -s "$W/x86_64-windows/winemetal.dll" "$sys/winemetal.dll" || cp -f "$W/x86_64-windows/winemetal.dll" "$sys/winemetal.dll"
+  echo dxmt > "$pfx/.steamac-gfx"
+fi
+exec "$ov/proton" "$@"

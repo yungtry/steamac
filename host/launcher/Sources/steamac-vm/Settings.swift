@@ -24,7 +24,7 @@ final class LauncherSettings: ObservableObject {
              closeAction, checkForUpdates, followMacTime, shareClipboard, shareConcealedClipboard
         // Display
         case dpiSource, fixedDPI, fixedWidthMM, fixedHeightMM, refreshRate, followWindowSize, windowWidth, windowHeight,
-             windowSizePreset, retinaResolution, metalHUD, superResolution, renderScale
+             windowSizePreset, retinaResolution, metalHUD, superResolution, renderScale, upscaleLowerResolutions
         // Mouse
         case autoCaptureGames, gameNames
         // Controller
@@ -32,14 +32,15 @@ final class LauncherSettings: ObservableObject {
         // Sound
         case soundEnabled, soundOutputUID, soundVolume, soundMute, soundLatency
         // Advanced
-        case cpus, memMiB, sshEnabled, sshPort, network, lanRemotePlay, diskImage, steamosBranch, steamClient, vulkanDriver
+        case cpus, memMiB, sshEnabled, sshPort, network, lanRemotePlay, diskImage, steamosBranch, steamClient, vulkanDriver,
+             graphicsPath, frameLatency
 
         var nextStart: Bool {
             switch self {
             case .openFullscreen, .dpiSource, .fixedDPI, .fixedWidthMM, .fixedHeightMM, .refreshRate,
                  .windowWidth, .windowHeight, .windowSizePreset, .retinaResolution, .renderScale, .soundEnabled, .cpus, .memMiB, .sshEnabled,
                  .sshPort, .network, .lanRemotePlay,
-                 .diskImage, .steamClient, .followMacTime, .vulkanDriver:
+                 .diskImage, .steamClient, .followMacTime, .vulkanDriver, .graphicsPath, .frameLatency:
                 return true
             default:
                 return false
@@ -99,26 +100,25 @@ final class LauncherSettings: ObservableObject {
 
         var title: String {
             switch self {
-            case .frame: return "Steam Frame client"
-            case .deck: return "Steam Deck client"
-            case .deckbeta: return "Steam Deck client (beta)"
+            case .frame: return String(localized: "Steam Frame client")
+            case .deck: return String(localized: "Steam Deck client")
+            case .deckbeta: return String(localized: "Steam Deck client (beta)")
             }
         }
 
         var detail: String {
             switch self {
             case .frame:
-                return "Valve's ARM64 client for Steam Frame (a beta for a headset not yet released). "
-                    + "Until an account is signed in with Remember me, the Steam Deck client shows the sign-in QR code."
+                return String(localized: "Valve's ARM64 client for Steam Frame (a beta for a headset not yet released). Until an account is signed in with Remember me, the Steam Deck client shows the sign-in QR code.")
             case .deck:
-                return "The public ARM64 Steam Deck client (steamdeck_stable). Standard sign-in with an on-screen QR code."
+                return String(localized: "The public ARM64 Steam Deck client (steamdeck_stable). Standard sign-in with an on-screen QR code.")
             case .deckbeta:
-                return "The Steam Deck client beta (steamdeck_publicbeta). Standard sign-in with an on-screen QR code."
+                return String(localized: "The Steam Deck client beta (steamdeck_publicbeta). Standard sign-in with an on-screen QR code.")
             }
         }
 
         /// Switching re-downloads the client (about 1 GB) on the next start.
-        static let switchNote = "Switching downloads the other client (about 1 GB) when Steam starts."
+        static let switchNote = String(localized: "Switching downloads the other client (about 1 GB) when Steam starts.")
     }
 
     /// Host Vulkan driver behind Venus: virglrenderer, in the VM process, opens its dylib
@@ -141,30 +141,29 @@ final class LauncherSettings: ObservableObject {
         /// Main features and the oldest macOS it runs on (picker items).
         var summary: String {
             switch self {
-            case .moltenvk: return "Metal 3 · macOS 15+"
-            case .kosmickrisp: return "Metal 4 · macOS 26+"
+            case .moltenvk: return String(localized: "Metal 3 · macOS 15+")
+            case .kosmickrisp: return String(localized: "Metal 4 · macOS 26+")
             }
         }
 
-        var title: String { name + " · " + summary }
+        var title: String { String(localized: "\(name) · \(summary)") }
 
         var detail: String {
             let text: String
             switch self {
             case .moltenvk:
-                text = "Vulkan on Metal 3 through MoltenVK with steamac's patches (macOS 15 or newer)."
+                text = String(localized: "Vulkan on Metal 3 through MoltenVK with steamac's patches (macOS 15 or newer).")
             case .kosmickrisp:
-                text = "Mesa's Vulkan driver on Metal 4 (macOS 26 or newer). Faster than MoltenVK: Stellar Blade Demo "
-                    + "runs at ~29 FPS instead of ~18 on an M1 Max."
+                text = String(localized: "Mesa's Vulkan driver on Metal 4 (macOS 26 or newer). Faster than MoltenVK: Stellar Blade Demo runs at ~29 FPS instead of ~18 on an M1 Max.")
             }
-            return self == Self.preferred ? text + " Default on this Mac." : text
+            return self == Self.preferred ? text + " " + String(localized: "Default on this Mac.") : text
         }
 
         /// The default: KosmicKrisp where this Mac and build have it, else MoltenVK (fixed for the process).
         static let preferred: VulkanDriver = kosmickrisp.unavailableReason == nil ? .kosmickrisp : .moltenvk
 
         /// Switching changes the Venus driver identity: Steam and games rebuild their shader caches.
-        static let switchNote = "Switching makes Steam and games rebuild their shader caches."
+        static let switchNote = String(localized: "Switching makes Steam and games rebuild their shader caches.")
 
         /// The dylib virglrenderer opens through @rpath (the app's Frameworks, work/out/host/lib).
         var library: String {
@@ -174,17 +173,94 @@ final class LauncherSettings: ObservableObject {
             }
         }
 
-        /// Why this Mac or this build cannot use the driver; nil if it can.
-        var unavailableReason: String? {
+        private enum Unavailability {
+            case oldOS, missingLibrary
+        }
+
+        private var unavailability: Unavailability? {
             guard self == .kosmickrisp else { return nil }
             let tahoe = OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)
-            guard ProcessInfo.processInfo.isOperatingSystemAtLeast(tahoe) else { return "needs macOS 26 or newer (Metal 4)" }
-            guard let handle = dlopen("@rpath/" + library, RTLD_LAZY | RTLD_LOCAL) else {
-                return "not included in this build (\(library))"
-            }
+            guard ProcessInfo.processInfo.isOperatingSystemAtLeast(tahoe) else { return .oldOS }
+            guard let handle = dlopen("@rpath/" + library, RTLD_LAZY | RTLD_LOCAL) else { return .missingLibrary }
             dlclose(handle)
             return nil
         }
+
+        /// English diagnostic for logs and command-line errors.
+        var unavailableReason: String? {
+            switch unavailability {
+            case .oldOS: return "needs macOS 26 or newer (Metal 4)"
+            case .missingLibrary: return "not included in this build (\(library))"
+            case nil: return nil
+            }
+        }
+
+        var localizedUnavailableReason: String? {
+            switch unavailability {
+            case .oldOS: return String(localized: "needs macOS 26 or newer (Metal 4)")
+            case .missingLibrary: return String(localized: "not included in this build (\(library))")
+            case nil: return nil
+            }
+        }
+    }
+
+    /// How Windows games draw: through DXMT and the wmtr remoting context straight to Metal (lean), or
+    /// through DXVK, Venus and the host Vulkan driver (classic). The VM process enables the wmtr
+    /// virtio-gpu context (libkrun patch 0021) for the lean path; in the guest, the Proton-lean
+    /// compatibility tool uses DXMT only when that context is there and plain Proton otherwise.
+    enum GraphicsPath: String, CaseIterable, Identifiable {
+        case dxmt
+        case vulkan
+        var id: String { rawValue }
+
+        var name: String {
+            switch self {
+            case .dxmt: return "DXMT"
+            case .vulkan: return "Vulkan"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .dxmt: return String(localized: "DXMT (lean)")
+            case .vulkan: return String(localized: "Vulkan (classic)")
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .dxmt:
+                return String(localized: "Direct3D 11 games through DXMT, drawn by Metal on the Mac (games need the Proton-lean compatibility tool, chosen once per game in Steam).")
+            case .vulkan:
+                return String(localized: "Direct3D through DXVK on Vulkan (Venus) and the Vulkan driver below.")
+            }
+        }
+
+        /// The host side of the remoting context, in the app's Frameworks.
+        static let hostLibrary = "libwmtr_host.dylib"
+
+        /// Absolute path of hostLibrary in this bundle (libkrun dlopens STEAMAC_WMTR_LIB), nil if absent.
+        static var hostLibraryPath: String? {
+            guard let dir = Bundle.main.privateFrameworksPath else { return nil }
+            let p = (dir as NSString).appendingPathComponent(hostLibrary)
+            return FileManager.default.fileExists(atPath: p) ? p : nil
+        }
+
+        /// English diagnostic for logs and command-line errors; nil if this build can use the path.
+        var unavailableReason: String? {
+            guard self == .dxmt else { return nil }
+            return Self.hostLibraryPath == nil ? "not included in this build (\(Self.hostLibrary))" : nil
+        }
+
+        var localizedUnavailableReason: String? {
+            guard self == .dxmt else { return nil }
+            return Self.hostLibraryPath == nil ? String(localized: "not included in this build (\(Self.hostLibrary))") : nil
+        }
+
+        /// Classic until the lean path is measured ahead of it in VRChat (same world, EAC, hitch counts).
+        static let preferred: GraphicsPath = .vulkan
+
+        static let switchNote = String(localized: "Applies from the next start.")
     }
 
     /// Default window size choices (window points = guest pixels).
@@ -194,9 +270,9 @@ final class LauncherSettings: ObservableObject {
     }
 
     static let sizePresets: [SizePreset] = [
-        .init(width: 1280, height: 800, label: "Steam Deck, 16:10"), .init(width: 1280, height: 720, label: "16:9"),
+        .init(width: 1280, height: 800, label: String(localized: "Steam Deck, 16:10")), .init(width: 1280, height: 720, label: "16:9"),
         .init(width: 1440, height: 900, label: "16:10"), .init(width: 1600, height: 900, label: "16:9"),
-        .init(width: 1680, height: 1050, label: "16:10"), .init(width: 1920, height: 1080, label: "Full HD, 16:9"),
+        .init(width: 1680, height: 1050, label: "16:10"), .init(width: 1920, height: 1080, label: String(localized: "Full HD, 16:9")),
         .init(width: 1920, height: 1200, label: "16:10"), .init(width: 2560, height: 1440, label: "QHD, 16:9"),
         .init(width: 2560, height: 1600, label: "16:10"), .init(width: 3440, height: 1440, label: "21:9"),
         .init(width: 3840, height: 2160, label: "4K, 16:9"),
@@ -275,6 +351,10 @@ final class LauncherSettings: ObservableObject {
     /// Guest render scale 0.25...1.0 of the window's pixel size (Options.renderScale): the guest
     /// renders fewer pixels and MetalFX super resolution upscales them to the window; next start.
     @Published var renderScale = 1.0 { didSet { save(.renderScale, renderScale) } }
+    /// While the guest game renders below the window size, the guest scanout follows the game's
+    /// window size and the Mac upscales it to the window (Renderer; MetalFX up to 1.5x per axis,
+    /// bilinear above). The window and the Retina guest maximum are unchanged. Applies now.
+    @Published var upscaleLowerResolutions = false { didSet { save(.upscaleLowerResolutions, upscaleLowerResolutions) } }
     // Mouse
     @Published var autoCaptureGames = true { didSet { save(.autoCaptureGames, autoCaptureGames) } }
     @Published private(set) var games: [Game] = []
@@ -316,6 +396,11 @@ final class LauncherSettings: ObservableObject {
     @Published var steamClient = SteamClient.deck { didSet { save(.steamClient, steamClient.rawValue) } }
     /// Host Vulkan driver of the next start (VulkanDriver).
     @Published var vulkanDriver = VulkanDriver.preferred { didSet { save(.vulkanDriver, vulkanDriver.rawValue) } }
+    /// Graphics path of the next start (GraphicsPath).
+    @Published var graphicsPath = GraphicsPath.preferred { didSet { save(.graphicsPath, graphicsPath.rawValue) } }
+    /// Frame latency mode of the next start (Vulkan path; kernel cmdline `steamac.frame_latency=1`).
+    /// Off by default: the guest's DXVK config is left unchanged.
+    @Published var frameLatency = false { didSet { save(.frameLatency, frameLatency) } }
 
     init() {
         let domain = LauncherSettings.domain
@@ -370,6 +455,7 @@ final class LauncherSettings: ObservableObject {
         bool(.retinaResolution, &retinaResolution)
         bool(.metalHUD, &metalHUD)
         bool(.superResolution, &superResolution)
+        bool(.upscaleLowerResolutions, &upscaleLowerResolutions)
         if let v = d.object(forKey: Key.renderScale.rawValue) as? Double { renderScale = min(1, max(0.25, v)) }
         bool(.autoCaptureGames, &autoCaptureGames)
         bool(.virtualPad, &virtualPad)
@@ -397,6 +483,8 @@ final class LauncherSettings: ObservableObject {
         }
         if let s = d.string(forKey: Key.steamClient.rawValue).flatMap(SteamClient.init(rawValue:)) { steamClient = s }
         if let v = d.string(forKey: Key.vulkanDriver.rawValue).flatMap(VulkanDriver.init(rawValue:)) { vulkanDriver = v }
+        if let v = d.string(forKey: Key.graphicsPath.rawValue).flatMap(GraphicsPath.init(rawValue:)) { graphicsPath = v }
+        bool(.frameLatency, &frameLatency)
         reloadGames()
     }
 
@@ -446,6 +534,7 @@ final class LauncherSettings: ObservableObject {
         case .retinaResolution: guard let b else { return false }; retinaResolution = b
         case .metalHUD: guard let b else { return false }; metalHUD = b
         case .superResolution: guard let b else { return false }; superResolution = b
+        case .upscaleLowerResolutions: guard let b else { return false }; upscaleLowerResolutions = b
         case .renderScale: guard let d, (0.25...1.0).contains(d) else { return false }; renderScale = d
         case .autoCaptureGames: guard let b else { return false }; autoCaptureGames = b
         case .gameNames: return false
@@ -470,6 +559,8 @@ final class LauncherSettings: ObservableObject {
         case .steamosBranch: guard DiskCreator.branches.contains(text) else { return false }; steamosBranch = text
         case .steamClient: guard let v = SteamClient(rawValue: text) else { return false }; steamClient = v
         case .vulkanDriver: guard let v = VulkanDriver(rawValue: text) else { return false }; vulkanDriver = v
+        case .graphicsPath: guard let v = GraphicsPath(rawValue: text) else { return false }; graphicsPath = v
+        case .frameLatency: guard let b else { return false }; frameLatency = b
         }
         return true
     }
@@ -492,6 +583,7 @@ final class LauncherSettings: ObservableObject {
         windowWidth = fresh.windowWidth; windowHeight = fresh.windowHeight; windowSizePreset = fresh.windowSizePreset
         retinaResolution = fresh.retinaResolution
         metalHUD = fresh.metalHUD; superResolution = fresh.superResolution; renderScale = fresh.renderScale
+        upscaleLowerResolutions = fresh.upscaleLowerResolutions
         autoCaptureGames = fresh.autoCaptureGames
         virtualPad = fresh.virtualPad; padType = fresh.padType; dualSensePassthrough = fresh.dualSensePassthrough
         controllerID = fresh.controllerID; swapABXY = fresh.swapABXY
@@ -501,6 +593,8 @@ final class LauncherSettings: ObservableObject {
         lanRemotePlay = fresh.lanRemotePlay
         diskImage = fresh.diskImage; steamosBranch = fresh.steamosBranch; steamClient = fresh.steamClient
         vulkanDriver = fresh.vulkanDriver
+        graphicsPath = fresh.graphicsPath
+        frameLatency = fresh.frameLatency
         loading = false
         reloadGames()
         log("settings: reset to defaults")
@@ -534,7 +628,7 @@ final class LauncherSettings: ObservableObject {
             .soundEnabled: soundEnabled, .cpus: cpus, .memMiB: memMiB, .sshEnabled: sshEnabled, .sshPort: sshPort,
             .network: network, .lanRemotePlay: lanRemotePlay,
             .diskImage: diskImage, .steamClient: steamClient.rawValue, .followMacTime: followMacTime,
-            .vulkanDriver: vulkanDriver.rawValue,
+            .vulkanDriver: vulkanDriver.rawValue, .graphicsPath: graphicsPath.rawValue, .frameLatency: frameLatency,
         ]
         var s: [Key: String] = [:]
         for (k, v) in values where k.nextStart && overrides[k] == nil { s[k] = "\(v)" }

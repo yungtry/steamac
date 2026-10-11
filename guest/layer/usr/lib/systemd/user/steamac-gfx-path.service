@@ -1,0 +1,16 @@
+# steamac: keeps the graphics path chosen in the launcher (steamac.gfx=dxmt) in place while Steam runs:
+# Steam may update a Proton after its start, which brings the stock DXVK set back; this re-applies DXMT
+# (see /usr/lib/steamac/steam-gfx-path). Exits at once on the Vulkan path.
+# Pulled in by gamescope-session.target and plasma-session.target through .wants symlinks in the layer.
+[Unit]
+Description=FX Steam Launcher graphics path (DXMT) for Proton
+PartOf=gamescope-session.target plasma-session.target
+After=steam.service
+
+[Service]
+Type=simple
+Slice=session.slice
+ExecStart=/usr/lib/steamac/steam-gfx-path --watch
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=3

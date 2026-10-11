@@ -45,6 +45,11 @@ final class Renderer {
     var superResolution = false {
         didSet { if !superResolution { releaseScaler() } }
     }
+    /// Lower-game-resolution mode (Settings > Display > "Upscale lower game resolutions"): set by the
+    /// window while the guest shows the game's own size. nil = off (no cost, the code path above is
+    /// unchanged). Set: MetalFX runs for upscales up to this factor per axis (even without
+    /// `superResolution`); larger ones use the bilinear draw (no MetalFX, crisp integer nearest off).
+    var upscaleCap: Double? = nil
     /// The MetalFX spatial scaler runs on this Mac's GPU (every Apple silicon Mac).
     static let superResolutionSupported: Bool =
         MTLCreateSystemDefaultDevice().map { MTLFXSpatialScalerDescriptor.supportsDevice($0) } ?? false
@@ -230,8 +235,9 @@ final class Renderer {
             vp = MTLViewport(originX: Double(fit.minX.rounded()), originY: Double(fit.minY.rounded()),
                              width: Double(fit.width.rounded()), height: Double(fit.height.rounded()), znear: 0, zfar: 1)
             let sx = vp.width / Double(texture.width), sy = vp.height / Double(texture.height)
-            nearestSampling = sx >= 1 && abs(sx - sx.rounded()) < 0.001 && abs(sy - sx) < 0.001
-            if superResolution, sx > 1, sy > 1,
+            nearestSampling = upscaleCap == nil && sx >= 1 && abs(sx - sx.rounded()) < 0.001 && abs(sy - sx) < 0.001
+            let metalFXAllowed = upscaleCap.map { max(sx, sy) <= $0 } ?? superResolution
+            if metalFXAllowed, sx > 1, sy > 1,
                case let (s, out)? = scaler(for: texture, width: Int(vp.width), height: Int(vp.height)) {
                 s.colorTexture = texture   // a new frame texture of the same size reuses the scaler
                 s.encode(commandBuffer: cb)
@@ -255,9 +261,9 @@ final class Renderer {
         enc.endEncoding()
     }
 
-    /// `flushedAt` > 0 marks a new guest frame for the perf stats (on-screen time and latency).
-    func draw(to layer: CAMetalLayer, flushedAt: CFTimeInterval = 0) {
-        let perf = flushedAt > 0 ? PerfStats.shared : nil
+    /// `stamp.flushedAt` > 0 marks a new guest frame for the perf stats (on-screen time, latency, export).
+    func draw(to layer: CAMetalLayer, stamp: PerfStats.FrameStamp = .init()) {
+        let perf = stamp.flushedAt > 0 ? PerfStats.shared : nil
         let t0 = perf != nil ? CACurrentMediaTime() : 0
         guard layer.drawableSize.width >= 1, layer.drawableSize.height >= 1,
               let drawable = layer.nextDrawable(),
@@ -274,7 +280,7 @@ final class Renderer {
         }
         if let perf {
             perf.waitedForDrawable(ms: (CACurrentMediaTime() - t0) * 1000)
-            cb.addCompletedHandler { _ in perf.rendered(flushedAt: flushedAt) }
+            cb.addCompletedHandler { _ in perf.rendered(stamp) }
         }
         encode(into: drawable.texture, commandBuffer: cb)
         if let capture = captureNextDraw, !layer.framebufferOnly {

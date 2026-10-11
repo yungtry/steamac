@@ -5,6 +5,12 @@
 # (bundle.sh; skipped with STEAMAC_NO_BUNDLE=1 or when the kernel/initramfs/layer images are
 # not built yet). Debug symbols for crash reports go to work/out/dSYMs (see dist.sh).
 #
+# Localizations (English source, ru, zh-Hans): the compiler extracts the UI strings
+# (-emit-localized-strings: SwiftUI literals, String(localized:)) and l10n.py syncs them into
+# Localizable.xcstrings (new keys added, removed ones marked stale, as Xcode does: commit the
+# catalog with the code), reports untranslated keys and compiles both catalogs to
+# work/out/<lang>.lproj (next to the dev binary) and the .app's Resources (bundle.sh).
+#
 # libkrun (v1.19.6 C API, built with GPU=1 INPUT=1 BLK=1 NET=1) is taken from
 # $KRUN_PREFIX (default: work/out/host, produced by host/libkrun). The binary's rpath is
 # @executable_path/host/lib (= work/out/host/lib) first, then $KRUN_PREFIX/lib.
@@ -54,6 +60,7 @@ SWIFT_FLAGS=(
     -Xlinker -rpath -Xlinker @executable_path/host/lib
     -Xlinker -rpath -Xlinker "$KRUN_PREFIX/lib"
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$PLIST"
+    -Xswiftc -emit-localized-strings -Xswiftc -emit-localized-strings-path -Xswiftc "$HERE/.build/stringsdata"
 )
 
 "$HERE/fetch-zstd.sh"
@@ -66,6 +73,17 @@ else
     rm -f "$BIN"
 fi
 swift build "${SWIFT_FLAGS[@]}"
+
+if xcrun --find xcstringstool >/dev/null 2>&1; then
+    python3 "$HERE/l10n.py" sync "$HERE/.build/stringsdata"
+    python3 "$HERE/l10n.py" check
+    python3 "$HERE/l10n.py" compile "$HERE/.build/l10n"
+else
+    # Command Line Tools only (no Xcode): no xcstringstool, so the catalogs are neither synced nor compiled;
+    # the app shows its English source strings.
+    echo "warning: xcstringstool not found (needs Xcode): building without localizations" >&2
+    mkdir -p "$HERE/.build/l10n"
+fi
 
 # Debug files for crash reports (dist.sh uploads them with sentry-cli): the launcher's dSYM and
 # dSYMs of the libraries the .app bundles (their builds carry no DWARF, so these hold the symbol
@@ -94,6 +112,12 @@ fi
 
 codesign --force --sign - --entitlements "$HERE/steamac-vm.entitlements" "$tmp"
 mv -f "$tmp" "$OUT/steamac-vm"
+# Bundle.main of the bare dev binary resolves its .lproj directories next to it.
+for lproj in "$HERE/.build/l10n"/*.lproj; do
+    [[ -d $lproj ]] || continue   # none without Xcode (see above)
+    rm -rf "$OUT/$(basename "$lproj")"
+    cp -R "$lproj" "$OUT/"
+done
 
 "$HERE/fetch-gvproxy.sh"
 "$HERE/fetch-desync.sh"

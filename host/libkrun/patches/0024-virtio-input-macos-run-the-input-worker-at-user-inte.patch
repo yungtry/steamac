@@ -1,0 +1,60 @@
+From 90ea719bf437434d3d4809eb4caed6b33ed430b7 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Sun, 11 Oct 2026 00:59:08 +0300
+Subject: [PATCH] virtio-input(macos): run the input worker at user-interactive
+ QoS
+
+Key presses and pointer motion reach the guest through the input worker;
+like the vCPUs and the GPU worker (patch 0013) it now runs at
+QOS_CLASS_USER_INTERACTIVE, so a busy host does not delay input. Test:
+the QoS helper applies to the calling thread.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/devices/src/virtio/input/worker.rs |  4 ++++
+ src/utils/src/macos/mod.rs             | 17 +++++++++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/src/devices/src/virtio/input/worker.rs b/src/devices/src/virtio/input/worker.rs
+index b95d131..ec489c1 100644
+--- a/src/devices/src/virtio/input/worker.rs
++++ b/src/devices/src/virtio/input/worker.rs
+@@ -61,6 +61,10 @@ impl InputWorker {
+ 
+     fn work(mut self) {
+         debug!("input worker: starting");
++        // Input reaches the guest through this thread: run it at the QoS of the vCPUs and the GPU worker
++        // so a busy host does not delay key presses and pointer motion.
++        #[cfg(target_os = "macos")]
++        utils::macos::set_thread_qos_user_interactive();
+ 
+         // Create the events instance in this thread
+         let mut events_instance = match self.backend_wrapper.create_instance() {
+diff --git a/src/utils/src/macos/mod.rs b/src/utils/src/macos/mod.rs
+index 03b1d18..09908de 100644
+--- a/src/utils/src/macos/mod.rs
++++ b/src/utils/src/macos/mod.rs
+@@ -8,3 +8,20 @@ pub fn set_thread_qos_user_interactive() {
+     // SAFETY: only changes the calling thread's scheduling class.
+     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+ }
++
++#[cfg(test)]
++mod tests {
++    #[test]
++    fn qos_user_interactive_applies_to_the_calling_thread() {
++        std::thread::spawn(|| {
++            super::set_thread_qos_user_interactive();
++            let mut qos = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
++            let mut rel = 0;
++            // SAFETY: reads the calling thread's own QoS into locals.
++            unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut qos, &mut rel) };
++            assert_eq!(qos as u32, libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE as u32);
++        })
++        .join()
++        .unwrap();
++    }
++}
+-- 
+2.39.5 (Apple Git-154)
+

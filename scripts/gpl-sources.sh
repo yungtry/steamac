@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Package corresponding GPL source for the kernel and static initramfs tools in a release.
+# Package corresponding source for a release: the GPL kernel and static initramfs tools, and the LGPL
+# DXMT source (pinned tarball, host/dxmt/patches, wmtr/) behind libwmtr_host.dylib.
 # Usage: scripts/gpl-sources.sh [GIT_REF] (HEAD uses the current working tree).
 # The tagged files are read with git archive, never checked out over the working tree.
 set -euo pipefail
@@ -21,6 +22,10 @@ if [[ $REF == HEAD ]]; then
         cp "$ROOT/$path" "$ST/repo/$path"
     done
     cp -R "$ROOT/guest/kernel" "$ST/repo/guest/"
+    if [[ -f $ROOT/host/dxmt/pin.env ]]; then
+        # Tracked files only: build output under wmtr/ stays out.
+        git -C "$ROOT" ls-files -z -- host/dxmt wmtr | tar -C "$ROOT" --null -T - -cf - | tar -xf - -C "$ST/repo"
+    fi
 else
     git -C "$ROOT" rev-parse --verify "$REF^{commit}" >/dev/null
     git -C "$ROOT" archive "$REF" host/launcher/Info.plist scripts/config.env \
@@ -28,6 +33,9 @@ else
         guest/initramfs/init guest/kernel | tar -xf - -C "$ST/repo"
     cp "$ST/repo/host/launcher/Info.plist" "$ST/Info.plist"
     rm -rf "$ST/repo/host"
+    if git -C "$ROOT" cat-file -e "$REF:host/dxmt/pin.env" 2>/dev/null; then
+        git -C "$ROOT" archive "$REF" host/dxmt wmtr | tar -xf - -C "$ST/repo"
+    fi
 fi
 version=$(plutil -extract CFBundleShortVersionString raw -o - "$ST/Info.plist")
 [[ $version =~ ^[0-9]+(\.[0-9]+)*$ ]] || { echo "invalid app version: $version" >&2; exit 1; }
@@ -66,6 +74,30 @@ copy_source "$ROOT/work/cache/e2fsprogs/$E2FSPROGS_VERSION/e2fsprogs-$E2FSPROGS_
     "$E2FSPROGS_URL" "$E2FSPROGS_SHA256" "e2fsprogs-$E2FSPROGS_VERSION.tar.xz"
 copy_source "$ROOT/work/cache/btrfs-progs/$BTRFSPROGS_VERSION/btrfs-progs-v$BTRFSPROGS_VERSION.tar.xz" \
     "$BTRFSPROGS_URL" "$BTRFSPROGS_SHA256" "btrfs-progs-v$BTRFSPROGS_VERSION.tar.xz"
+
+# DXMT (LGPL-2.1-or-later), present from the release that ships the DXMT graphics path.
+dxmt_notes=
+if [[ -f $ST/repo/host/dxmt/pin.env ]]; then
+    . "$ST/repo/host/dxmt/pin.env"
+    [[ $DXMT_COMMIT =~ ^[[:xdigit:]]{40}$ && $DXMT_SHA256 =~ ^[[:xdigit:]]{64}$ && $LLVM_VERSION =~ ^[0-9]+(\.[0-9]+)*$ ]] || {
+        echo 'invalid host/dxmt/pin.env' >&2; exit 1;
+    }
+    copy_source "$ROOT/work/cache/dxmt/dxmt-$DXMT_COMMIT.tar.gz" "$DXMT_URL" "$DXMT_SHA256" "dxmt-$DXMT_COMMIT.tar.gz"
+    dxmt_notes="
+libwmtr_host.dylib (the DXMT graphics path, loaded by libkrun at run time and
+replaceable by a rebuilt library of the same name): DXMT, LGPL-2.1-or-later,
+sources/dxmt-$DXMT_COMMIT.tar.gz ($DXMT_REPO at that commit, SHA-256
+$DXMT_SHA256). Apply repo/host/dxmt/patches/*.patch in filename order with
+git apply (patch -p1 also works). repo/wmtr/ links DXMT's
+src/winemetal/unix/winemetal_unix.c and its src/airconv (with DXBCParser)
+into the library: build per the header of repo/wmtr/Makefile (make host).
+DXMT's own git submodules (NVIDIA nvapi and misyltoad's mingw-directx-headers,
+revisions recorded in the DXMT commit) are used only for the Windows-side DLLs
+and are not part of the library. The shader compiler links LLVM $LLVM_VERSION
+statically (Apache-2.0 with LLVM exception; its licence text is in the app's
+licenses folder), built from the llvmorg-$LLVM_VERSION tag of
+github.com/llvm/llvm-project."
+fi
 
 # Resolve busybox-static's *source* version from the same snapshot/architecture
 # apt used in Dockerfile. The binary can have a different +bN rebuild suffix.
@@ -153,6 +185,7 @@ repo/guest/initramfs/init. Its static binaries are:
   /bin/btrfstune: sources/btrfs-progs-v$BTRFSPROGS_VERSION.tar.xz, built
     statically in step 20. See that script for all configure/make flags.
 
+$dxmt_notes
 Debian snapshot archive: $snapshot
 EOF
 

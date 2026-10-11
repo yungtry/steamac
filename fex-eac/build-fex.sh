@@ -1,37 +1,52 @@
 #!/bin/sh
-# Build FEX-2610 with the EAC patches inside the SteamOS guest and stage the runtime for install-fex-tool.sh.
-# POSIX sh; needs the guest's clang 19, cmake, ninja, lld, git, python3. Re-running is safe.
+# Build the patched FEX (StonkGuy/FEX, a pinned eac-* tag) inside the SteamOS guest and stage the runtime for
+# install-fex-tool.sh. POSIX sh; needs the guest's clang 19, cmake, ninja, lld, git, python3. Re-running is safe.
 set -eu
 
 WORK=${WORK:-$HOME/fex-eac-work}
 SRC=$WORK/FEX
 STAGE=$WORK/stage
-TAG=FEX-2610
-BASE=14c92681f4d62cf84d901460e0358de09c8847a7
+REPO=https://github.com/StonkGuy/FEX.git
+FEX_EAC_TAG=eac-2610.2
+FEX_EAC_SHA=cc1cc2a14da9f2e844f5b2b2b5bec3db237bb836
+# Downstream patches applied on top of the tag (patches not in StonkGuy/FEX yet).
 PATCHES=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/patches
 
 set -- "$PATCHES"/*.patch
+[ -e "$1" ] || set --
 NPATCH=$#
 
-# Clone the exact upstream tag with shallow submodules unless the tree is already there.
+# Clone the exact tag with shallow submodules unless the tree is already there.
 if [ ! -d "$SRC/.git" ]; then
   mkdir -p "$WORK"
-  git clone --recurse-submodules --shallow-submodules --branch "$TAG" \
-    https://github.com/FEX-Emu/FEX.git "$SRC"
+  git clone --recurse-submodules --shallow-submodules --branch "$FEX_EAC_TAG" "$REPO" "$SRC"
 fi
 cd "$SRC"
 
-# The clone must be the commit the patches were made against.
-TAGSHA=$(git rev-parse "$TAG^{commit}")
-[ "$TAGSHA" = "$BASE" ] || { echo "$TAG is $TAGSHA, expected $BASE" >&2; exit 1; }
+# The tree must be the pinned commit, or the pinned commit with a prefix of the downstream series from an earlier run.
+# A tree from an older build-fex.sh (upstream FEX-2610 with the patch files applied by git am) or from another tag is
+# not updated in place.
+ONTOP=-1
+if git merge-base --is-ancestor "$FEX_EAC_SHA" HEAD 2>/dev/null; then
+  ONTOP=$(git rev-list --count "$FEX_EAC_SHA"..HEAD)
+fi
+if [ "$ONTOP" -lt 0 ] || [ "$ONTOP" -gt "$NPATCH" ]; then
+  if git cat-file -e "$FEX_EAC_TAG^{commit}" 2>/dev/null &&
+     [ "$(git rev-parse "$FEX_EAC_TAG^{commit}")" = "$FEX_EAC_SHA" ] && git diff --quiet HEAD; then
+    git checkout -q "$FEX_EAC_TAG" && git submodule update --init --recursive --depth 1
+    ONTOP=0
+  else
+    echo "$SRC is at $(git rev-parse --short HEAD), not $FEX_EAC_TAG ($FEX_EAC_SHA)." >&2
+    echo "It is probably a tree from an older build-fex.sh. Remove it and run this script again:" >&2
+    echo "  rm -rf '$SRC'" >&2
+    exit 1
+  fi
+fi
+[ "$(git rev-parse "$FEX_EAC_TAG^{commit}")" = "$FEX_EAC_SHA" ] ||
+  { echo "$FEX_EAC_TAG is $(git rev-parse "$FEX_EAC_TAG^{commit}"), expected $FEX_EAC_SHA" >&2; exit 1; }
 
-# Apply the patch series once; a re-run must find the series (or an older, shorter build of it) and nothing else.
-# A tree built before patches were added carries a prefix of the series: apply only the patches it lacks.
-ONTOP=$(git rev-list --count "$BASE"..HEAD)
-if [ "$ONTOP" -gt "$NPATCH" ]; then
-  echo "$(git rev-parse --short HEAD) has $ONTOP commits on top of $BASE; expected at most $NPATCH" >&2
-  exit 1
-elif [ "$ONTOP" -lt "$NPATCH" ]; then
+# Apply the downstream patches the tree lacks; a re-run finds them already applied.
+if [ "$ONTOP" -lt "$NPATCH" ]; then
   shift "$ONTOP"
   git -c user.name=build -c user.email=build@invalid am "$@"
 fi
@@ -55,4 +70,4 @@ cmake -S . -B build-steam -G Ninja \
 cmake --build build-steam -j"${JOBS:-$(nproc)}"
 DESTDIR=$STAGE cmake --install build-steam --component Runtime
 
-echo "staged: $STAGE"
+echo "staged: $STAGE ($FEX_EAC_TAG + $NPATCH downstream patches)"

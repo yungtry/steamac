@@ -30,13 +30,15 @@ final class OverlayView: NSView {
                 blue: CGFloat(hex & 0xff) / 255, alpha: alpha)
     }
 
-    /// Host Vulkan driver of this boot (VM.start).
+    /// Host Vulkan driver and graphics path of this boot (VM.start).
     static var vulkanDriver = LauncherSettings.VulkanDriver.moltenvk
+    static var graphicsPath = LauncherSettings.GraphicsPath.vulkan
 
     static var gpuFooter: String {
         let gpu = MTLCreateSystemDefaultDevice()?.name ?? "Apple GPU"
         let short = gpu.hasPrefix("Apple ") ? String(gpu.dropFirst(6)) : gpu
-        return "SteamOS · Venus → \(vulkanDriver.name) · \(short)"
+        let path = graphicsPath == .dxmt ? "DXMT" : vulkanDriver.name
+        return "SteamOS · \(path) · \(short)"
     }
 
     override init(frame: NSRect) {
@@ -64,12 +66,12 @@ final class OverlayView: NSView {
             t.isWrapped = false
         }
         percentLayer.alignmentMode = .right
-        wordmark.shadowColor = OverlayView.color(0x66c0f4)
-        wordmark.shadowOpacity = 0.9
-        wordmark.shadowOffset = .zero
+        // Quiet by design: no moving sheen, no glow, no pulsing wordmark.
+        glow.isHidden = true
+        sheen.isHidden = true
         track.backgroundColor = OverlayView.color(0xffffff, 0.08)
         track.masksToBounds = true
-        fill.colors = [OverlayView.color(0x1a9fff), OverlayView.color(0x66c0f4)]
+        fill.colors = [OverlayView.color(0x1a9fff), OverlayView.color(0x1a9fff)]
         fill.startPoint = CGPoint(x: 0, y: 0.5)
         fill.endPoint = CGPoint(x: 1, y: 0.5)
         fill.anchorPoint = CGPoint(x: 0, y: 0.5)
@@ -138,20 +140,6 @@ final class OverlayView: NSView {
     }
 
     private func startAnimations() {
-        let a = CABasicAnimation(keyPath: "position.x")
-        a.fromValue = -bounds.width * 0.6
-        a.toValue = bounds.width * 1.6
-        a.duration = 7
-        a.repeatCount = .infinity
-        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        sheen.add(a, forKey: "sheen")
-        let g = CABasicAnimation(keyPath: "shadowRadius")
-        g.fromValue = 12 * scaleFactor
-        g.toValue = 22 * scaleFactor
-        g.duration = 2.4
-        g.autoreverses = true
-        g.repeatCount = .infinity
-        wordmark.add(g, forKey: "glow")
         updateIndeterminate()
     }
 
@@ -239,9 +227,8 @@ final class OverlayView: NSView {
         sheen.position = CGPoint(x: -b.width, y: b.midY)
 
         let wmHeight = 64 * k
-        wordmark.string = attributed("FX STEAM LAUNCHER", size: 46 * k, weight: .heavy, color: OverlayView.color(0xffffff), kern: 9 * k)
+        wordmark.string = attributed("FX Steam Launcher", size: 34 * k, weight: .semibold, color: OverlayView.color(0xe6ebef), kern: 0.5 * k)
         wordmark.frame = CGRect(x: 0, y: b.midY + 46 * k, width: b.width, height: wmHeight)
-        wordmark.shadowRadius = 16 * k
         titleLayer.frame = CGRect(x: 40 * k, y: b.midY + 4 * k, width: b.width - 80 * k, height: 28 * k)
         let barWidth = min(560 * k, b.width * 0.72)
         let barHeight = max(4, 6 * k)

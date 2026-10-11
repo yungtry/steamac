@@ -19,11 +19,13 @@ do {
     (options, settingsOverrides) = try Options.resolve(CommandLine.arguments, settings: settings)
 } catch {
     FileHandle.standardError.write("steamac-vm: \(error)\n\n\(Options.usage)\n".data(using: .utf8)!)
-    MainActor.assumeIsolated { AppBundle.alertIfLaunchedFromFinder("FX Steam Launcher cannot start", "\(error)") }
+    MainActor.assumeIsolated { AppBundle.alertIfLaunchedFromFinder("FX Steam Launcher cannot start", error.localizedDescription) }
     exit(2)
 }
 
 if options.selftestMetalCache { MetalCompilerCache.selfTest() }
+if options.selftestGameLayers { GameLayerSelfTest.run() }
+if options.selftestGraphicsPath { GraphicsPathSelfTest.run(options) }
 // Before CrashReporting's GPU tags, the window or either Vulkan driver can initialise Metal.
 MetalCompilerCache.prepare()
 
@@ -31,12 +33,15 @@ MetalCompilerCache.prepare()
 // level, which buries the guest console. Errors only, unless the user asks for more.
 setenv("MVK_CONFIG_LOG_LEVEL", "1", 0)
 // Metal Performance HUD (Settings > Display, View menu, Ctrl+Cmd+P): loads libMTLHud for this VM
-// process before Metal is first used; the window's layer then shows or hides it at runtime
-// (developerHUDProperties `mode`, default "off" in WindowController). Without this variable
-// macOS 15 ignores those properties. Command buffers that present nothing (MoltenVK's) get no HUD.
-// Only when the saved setting is on: with it off libMTLHud stays unloaded, so turning the HUD on
-// mid-run shows nothing until the next boot.
-if Supervisor.isChild && !options.headless && settings.metalHUD { setenv("MTL_HUD_ENABLED", "1", 1) }
+// process before Metal is first used; the window's layers then show or hide it at runtime
+// (developerHUDProperties `mode`, VMView.applyHUD: on the remoted game's layer on the DXMT path, else
+// on the guest picture). Without this variable macOS 15 ignores those properties. Command buffers that
+// present nothing (MoltenVK's) get no HUD. Always loaded, so the HUD can be turned on mid-run; with the
+// setting off it is hidden from the first frame on.
+if Supervisor.isChild && !options.headless { setenv("MTL_HUD_ENABLED", "1", 1) }
+// Mouse motion reaches the guest as AppKit delivers it: no coalescing of moves into one per display frame (up
+// to a refresh of added latency on pointer motion; the guest sees every move as relative input anyway).
+if Supervisor.isChild { PointerInput.configure() }
 
 // Crash reporting (Settings > General; both the supervisor and each VM process).
 CrashReporting.setUp(options: options, settings: settings)
@@ -136,7 +141,7 @@ final class Lifecycle: NSObject, NSApplicationDelegate {
             log("power key sent to guest; repeat the request to force quit")
         }
         progress?.hostRequestedShutdown()
-        window?.setStatus("shutting down… (close again to force quit)")
+        window?.setStatus(String(localized: "shutting down… (close again to force quit)"))
         startGraceTimer()
         if let suspender { suspender.whenAwake(pressPowerKey) } else { pressPowerKey() }
     }
@@ -162,7 +167,7 @@ final class Lifecycle: NSObject, NSApplicationDelegate {
         suspender?.resume(origin: "restart")
         progress.hostRequestedRestart()   // onRebootIntent writes the supervisor's reboot marker
         settingsContext?.restartRequested = true
-        window?.setStatus("restarting… (close to force quit)")
+        window?.setStatus(String(localized: "restarting… (close to force quit)"))
         startGraceTimer()
         let pressPowerKey = {
             guard vm.requestShutdown() else {
@@ -250,11 +255,12 @@ extension Lifecycle: NSMenuItemValidation {
         if item.action == #selector(menuMetalHUD) { item.state = LauncherSettings.shared.metalHUD ? .on : .off }
         if item.action == #selector(menuCheckForUpdates) {
             item.title = UpdateChecker.shared.menuTitle
-            item.badge = UpdateChecker.shared.available != nil ? NSMenuItemBadge(string: "New") : nil
+            item.badge = UpdateChecker.shared.available != nil ? NSMenuItemBadge(string: String(localized: "New", comment: "Badge on a menu item when an update is available")) : nil
         }
         if item.action == #selector(menuSuspend) {
             let suspended = suspender?.suspended ?? false
-            item.title = suspended ? "Resume" : "Suspend"
+            item.title = suspended ? String(localized: "Resume", comment: "App menu: resume the suspended VM")
+                                   : String(localized: "Suspend", comment: "App menu: freeze the VM in memory")
             return suspender != nil && requestedAt == nil
         }
         return true
@@ -335,9 +341,13 @@ do {
     let sound = SoundControl()
     if vm.hasSound {
         sound.attach(ctx: vm.ctx, settings: settings)
-        if let missing = sound.missingAPIReason { log("sound: live controls unavailable: \(missing)") }
+        if let missing = sound.missingAPILogReason { log("sound: live controls unavailable: \(missing)") }
     } else {
-        sound.detach(reason: options.sound ? "This libkrun has no sound support (SND=1)." : "Sound was off when this VM started.")
+        if options.sound {
+            sound.detach(reason: "This libkrun has no sound support (SND=1).")
+        } else {
+            sound.detach(reason: "Sound was off when this VM started.")
+        }
     }
 
     for sig in [SIGINT, SIGTERM, SIGHUP] {

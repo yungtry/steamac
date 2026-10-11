@@ -30,4 +30,4 @@ documentation, start at the repository's top-level `README.md` and `docs/fork.md
 - [Limitations](limitations.md) — known limitations
 - [License](license.md) — licensing of the upstream project
 
-The upstream [Русский](README.ru.md) README is also included here, unchanged.
+The upstream [Русский](README.ru.md) and [简体中文](README.zh.md) READMEs are also included here, unchanged.

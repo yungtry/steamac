@@ -74,6 +74,11 @@ struct Options {
     var macTime = true
     /// Host Vulkan driver of this boot (virglrenderer opens it; VM.start).
     var vulkanDriver = LauncherSettings.VulkanDriver.moltenvk
+    var graphicsPath = LauncherSettings.GraphicsPath.vulkan
+    var selftestGraphicsPath = false
+    /// Settings > Advanced "Frame latency" (kernel cmdline `steamac.frame_latency=1`): the guest's
+    /// DXVK config gets dxgi.maxFrameLatency = 1 for the Vulkan path. Default false: unset.
+    var frameLatency = false
     var shmMiB = 8192
     var gpuFlags: UInt32? = nil
     var gvproxyPath: String?
@@ -115,6 +120,7 @@ struct Options {
     var acceptLicense = false
     var selftestProvision = false
     var selftestMetalCache = false
+    var selftestGameLayers = false
     var referenceDisk: String?
     /// --ssh-password DISK: print the disk's generated guest password (GuestPassword) and exit.
     var showSSHPassword: String?
@@ -134,7 +140,8 @@ struct Options {
                       [--mouse auto|tablet|capture] [--no-gamepad] [--pad auto|xbox360|dualsense|dualshock4]
                       [--krun-log-level 0-5] [--perf-stats]
                       [--no-crash-reports] [--steam-client frame|deck|deckbeta]
-                      [--vulkan-driver moltenvk|kosmickrisp] [--lan-remote-play | --no-lan-remote-play]
+                      [--vulkan-driver moltenvk|kosmickrisp] [--graphics-path dxmt|vulkan]
+                      [--frame-latency | --no-frame-latency] [--lan-remote-play | --no-lan-remote-play]
            steamac-vm --selftest-display [--headless] [--selftest-out DIR] [--display WxH]
            steamac-vm --selftest-overlay [--selftest-out DIR] [--display WxH]
            steamac-vm --selftest-stall [--selftest-out DIR] [--display WxH]
@@ -143,6 +150,8 @@ struct Options {
            steamac-vm --selftest-provision [--reference-disk IMG]
            steamac-vm --selftest-remote-play
            steamac-vm --selftest-metal-cache
+           steamac-vm --selftest-game-layers
+           steamac-vm --selftest-graphics-path [--graphics-path dxmt|vulkan]
            steamac-vm --create-disk PATH [--branch stable|rc] [--home-gib N]
                       [--password PW] [--keep-cache] [--accept-eula]
            steamac-vm --ssh-password DISK
@@ -180,6 +189,7 @@ struct Options {
                            this DPI (physical size = new size x the same mm per pixel).
       --headless           no window and no input devices; SIGUSR1 dumps the latest frame
       --log FILE           also append the hvc0 console to FILE
+      -AppleLanguages '(L)' UI language for this run: en, ru or zh-Hans (default: the macOS language)
       --no-net             no virtio-net / gvproxy
       --lan-remote-play    expose Steam Remote Play on the LAN (Settings > Advanced; off by default)
       --no-lan-remote-play disable the LAN discovery relay and Remote Play forwards for this boot
@@ -222,6 +232,11 @@ struct Options {
                            include it: host/kosmickrisp);
                            moltenvk: MoltenVK with steamac's patches (every Mac).
                            Switching makes Steam and games rebuild their shader caches.
+      --frame-latency      frame latency mode on (kernel cmdline steamac.frame_latency=1; default:
+                           Settings > Advanced "Frame latency", off): the guest's DXVK config gets
+                           dxgi.maxFrameLatency = 1 (Vulkan path only), trading some throughput for
+                           lower input latency. Off means no key is added, so the guest side is
+                           unchanged. --no-frame-latency turns it off for this run.
 
     Creating a SteamOS disk (no Docker; the same code as Settings > Advanced "Create New Disk…"):
       --create-disk PATH   download the signed SteamOS bundle of the branch (default: the saved setting,
@@ -258,6 +273,7 @@ struct Options {
       --perf-stats         every 5 s log frame pacing (also STEAMAC_PERF_STATS=1): guest flush and
                            on-screen frame intervals (p50/p95/p99/max, count > 25 / > 50 ms), libkrun's
                            per-flush copy, flush -> screen latency, dropped/replaced frames, upload time
+                           (STEAMAC_PERF_FRAMES=<path> also appends one CSV line per shown frame)
       --selftest-display   feed synthetic frames (all formats) through the display backend vtable and
                            verify PNG dump, Metal render and (windowed) the presented drawable
       --input-selftest S   S seconds after boot, inject synthetic key/mouse/gamepad input, then
@@ -310,6 +326,8 @@ struct Options {
         while i < argv.count {
             let a = argv[i]
             if a.hasPrefix("-psn_") { i += 1; continue }   // old Finder process serial number
+            // Cocoa argument-domain overrides of the UI language (NSUserDefaults reads them itself).
+            if a == "-AppleLanguages" || a == "-AppleLocale" { i += 2; continue }
             o.explicit.insert(a)
             switch a {
             case "--kernel": o.kernel = try value(a)
@@ -360,6 +378,15 @@ struct Options {
                     throw OptionError("--steam-client: frame, deck or deckbeta")
                 }
                 o.steamClient = c
+            case "--graphics-path":
+                let v = try value(a)
+                guard let g = LauncherSettings.GraphicsPath(rawValue: v) else {
+                    throw OptionError("--graphics-path: dxmt or vulkan")
+                }
+                o.graphicsPath = g
+            case "--selftest-graphics-path": o.selftestGraphicsPath = true
+            case "--frame-latency": o.frameLatency = true
+            case "--no-frame-latency": o.frameLatency = false
             case "--vulkan-driver":
                 let v = try value(a)
                 guard let d = LauncherSettings.VulkanDriver(rawValue: v) else {
@@ -409,6 +436,7 @@ struct Options {
             case "--selftest-remote-play": o.selftestRemotePlay = true
             case "--selftest-provision": o.selftestProvision = true
             case "--selftest-metal-cache": o.selftestMetalCache = true
+            case "--selftest-game-layers": o.selftestGameLayers = true
             case "--reference-disk": o.referenceDisk = try value(a)
             case "--create-disk": o.createDisk = try value(a)
             case "--grow-disk": o.growDisk = try value(a)
@@ -441,6 +469,10 @@ struct Options {
             o.perfStats = true
             o.explicit.insert("STEAMAC_PERF_STATS=1")
         }
+        if let p = ProcessInfo.processInfo.environment["STEAMAC_PERF_FRAMES"], !p.isEmpty {
+            o.perfStats = true
+            o.explicit.insert("STEAMAC_PERF_FRAMES")
+        }
         if ProcessInfo.processInfo.environment[CrashReporting.disableEnv] == "0" {
             o.noCrashReports = true
             o.explicit.insert("\(CrashReporting.disableEnv)=0")
@@ -448,9 +480,15 @@ struct Options {
         return o
     }
 
+    /// Settings > Advanced "Frame latency" -> kernel cmdline key: on writes `steamac.frame_latency=1`,
+    /// off writes nothing (absent is the default). The key is `steamac.frame_latency`.
+    static func frameLatencyArg(_ on: Bool) -> (key: String, value: String)? {
+        on ? ("steamac.frame_latency", "1") : nil
+    }
+
     var isSelftest: Bool {
         selftestDisplay || selftestOverlay || selftestStall || selftestPill || selftestSettings || selftestProvision || selftestRemotePlay
-            || selftestMetalCache || createDisk != nil || growDisk != nil
+            || selftestMetalCache || selftestGameLayers || createDisk != nil || growDisk != nil
             || showSSHPassword != nil
     }
 
@@ -459,6 +497,13 @@ struct Options {
     static func resolve(_ argv: [String], settings: LauncherSettings) throws -> (Options, [LauncherSettings.Key: String]) {
         var o = try parse(argv)
         var overrides = o.applySettings(settings)
+        if let reason = o.graphicsPath.unavailableReason {
+            guard !o.explicit.contains("--graphics-path") else {
+                throw OptionError("--graphics-path \(o.graphicsPath.rawValue): \(o.graphicsPath.name) \(reason)")
+            }
+            log("gpu: \(o.graphicsPath.name) \(reason); using Vulkan")
+            o.graphicsPath = .vulkan
+        }
         if !o.isSelftest, let reason = o.vulkanDriver.unavailableReason {
             guard !o.explicit.contains("--vulkan-driver") else {
                 throw OptionError("--vulkan-driver \(o.vulkanDriver.rawValue): \(o.vulkanDriver.name) \(reason)")
@@ -478,6 +523,10 @@ struct Options {
             add("steamac.ssh", o.sshPort == 0 ? "0" : "1")
             add("steamac.steam_client", o.steamClient.rawValue)
             add("steamac.gpu_mib", String(VMSizing.gpuBudgetMiB(memMiB: o.memMiB)))
+            // the guest's Proton-lean tool uses DXMT only when the host offers the wmtr context
+            add("steamac.gfx", o.graphicsPath.rawValue)
+            // only written when on; absent is the default (off), so an explicit =0 needs no key
+            if let a = Options.frameLatencyArg(o.frameLatency) { add(a.key, a.value) }
             if o.macTime {
                 add("steamac.tz", MacTime.zone)
                 add("steamac.clock24", MacTime.clock24.map { $0 ? "1" : "0" })
@@ -531,6 +580,10 @@ struct Options {
         macTime = s.followMacTime
         if given("--steam-client") { ov[.steamClient] = "--steam-client \(steamClient.rawValue)" } else { steamClient = s.steamClient }
         if given("--vulkan-driver") { ov[.vulkanDriver] = "--vulkan-driver \(vulkanDriver.rawValue)" } else { vulkanDriver = s.vulkanDriver }
+        if given("--graphics-path") { ov[.graphicsPath] = "--graphics-path \(graphicsPath.rawValue)" } else { graphicsPath = s.graphicsPath }
+        if given("--frame-latency") || given("--no-frame-latency") {
+            ov[.frameLatency] = frameLatency ? "--frame-latency" : "--no-frame-latency"
+        } else { frameLatency = s.frameLatency }
         if given("--no-sound") { ov[.soundEnabled] = "--no-sound" } else { sound = s.soundEnabled }
         if given("--no-gamepad") { ov[.virtualPad] = "--no-gamepad" }
         if let padType { ov[.padType] = "--pad \(padType.rawValue)" }
@@ -641,7 +694,11 @@ enum MacTime {
     }
 }
 
-struct OptionError: Error, CustomStringConvertible {
+/// `description`: English, for the CLI, logs and crash reports ("\(error)"). `localizedDescription`:
+/// the UI text, `localized` when given (String(localized:)), else the English text.
+struct OptionError: LocalizedError, CustomStringConvertible {
     let description: String
-    init(_ d: String) { description = d }
+    let localized: String?
+    init(_ d: String, localized: String? = nil) { description = d; self.localized = localized }
+    var errorDescription: String? { localized ?? description }
 }

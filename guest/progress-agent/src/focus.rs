@@ -59,11 +59,23 @@ pub struct Focus {
     named: std::collections::HashSet<u32>,
     /// Desktop Mode session (see the module doc).
     desktop: bool,
+    /// Game focus: the focused X window whose size is reported (`game-size`), and its last size.
+    /// Its resizes come as ConfigureNotify (StructureNotify is selected on it).
+    size_win: Option<Window>,
+    last_size: Option<(u16, u16)>,
 }
 
 impl Focus {
     pub fn new(desktop: bool) -> Focus {
-        Focus { conn: None, next_connect: Instant::now(), last: None, named: load_named(), desktop }
+        Focus {
+            conn: None,
+            next_connect: Instant::now(),
+            last: None,
+            named: load_named(),
+            desktop,
+            size_win: None,
+            last_size: None,
+        }
     }
 
     /// Desktop Mode: the desktop window has had gamescope's focus (it is on screen).
@@ -118,7 +130,12 @@ impl Focus {
             match self.conn.as_ref().unwrap().conn.poll_for_event() {
                 Ok(Some(Event::PropertyNotify(e))) => {
                     let c = self.conn.as_ref().unwrap();
-                    if e.window == c.root && (e.atom == c.atom || (self.desktop && e.atom == c.window_atom)) {
+                    if e.window == c.root && (e.atom == c.atom || e.atom == c.window_atom) {
+                        changed = true;
+                    }
+                }
+                Ok(Some(Event::ConfigureNotify(e))) => {
+                    if self.size_win == Some(e.window) {
                         changed = true;
                     }
                 }
@@ -168,6 +185,8 @@ impl Focus {
         if force || self.last.as_deref() != Some(msg.as_str()) {
             port.send(&msg);
             self.last = Some(msg);
+            // The host forgets the game size on every focus change: resend it after `focus game`.
+            self.last_size = None;
             // First focus of this app id this boot: also its display name.
             if game && !self.named.contains(&value) {
                 self.named.insert(value);
@@ -176,6 +195,42 @@ impl Focus {
                     port.send(&format!("game {value} {name}"));
                 }
             }
+        }
+        if game {
+            self.report_game_size(port);
+        }
+    }
+}
+
+impl Focus {
+    /// `game-size <w>x<h>` for the focused game window (gamescope's GAMESCOPE_FOCUSED_WINDOW), sent
+    /// when it changes; the host sizes the guest display to it when the game renders below the window.
+    fn report_game_size(&mut self, port: &mut Port) {
+        let Some(c) = self.conn.as_ref() else { return };
+        let win = c
+            .conn
+            .get_property(false, c.root, c.window_atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut v| v.next()))
+            .filter(|&w| w != 0);
+        let Some(win) = win else {
+            self.size_win = None;
+            return;
+        };
+        if self.size_win != Some(win) {
+            let aux = ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY);
+            if c.conn.change_window_attributes(win, &aux).is_err() {
+                return;
+            }
+            self.size_win = Some(win);
+            self.last_size = None;
+        }
+        let Some(g) = c.conn.get_geometry(win).ok().and_then(|cookie| cookie.reply().ok()) else { return };
+        let size = (g.width, g.height);
+        if self.last_size != Some(size) {
+            self.last_size = Some(size);
+            port.send(&format!("game-size {}x{}", size.0, size.1));
         }
     }
 }

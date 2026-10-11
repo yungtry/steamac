@@ -18,6 +18,17 @@ import Synchronization
 ///           the main thread took them, main-thread upload and nextDrawable waits.
 ///
 /// Intervals over 25 ms (more than 1.5 frames at 60 Hz) and 50 ms are the visible stutters.
+///
+/// STEAMAC_PERF_FRAMES=<path> (implies the stats): one CSV line per shown frame, appended to <path>
+/// (header on a new file). Lines are buffered and written about once a second by a background
+/// writer, so the render threads make no syscalls per frame. Columns:
+///   t_ns       shown time (vsync-grid estimate) on the mach clock (DispatchTime.uptimeNanoseconds base)
+///   flush_ms   interval from the previous guest flush to this frame's flush
+///   shown_ms   interval from the previous shown frame
+///   copy_ms    libkrun's copy of this frame (alloc_frame -> present_frame)
+///   upload_ms  main-thread texture upload of this frame
+///   vsyncs     refreshes this frame was held for (0 without a display link)
+/// Off (env unset): no per-frame work; the stats path itself is off unless enabled.
 final class PerfStats {
     static let instance = PerfStats()
     private static let enabled = Atomic<Bool>(false)
@@ -38,6 +49,16 @@ final class PerfStats {
     private var drawableWaitMs: [Double] = []
     private var taken = 0
     private var lastFlush: CFTimeInterval = 0
+    // Per-frame values of the latest flush (GPU thread writes, main thread snapshots in frameTaken).
+    private var lastFlushDeltaMs: Double = 0
+    private var lastCopyMs: Double = 0
+    // Per-frame export (STEAMAC_PERF_FRAMES). framesOn and frameBuf: under `lock`; the rest: frameQueue.
+    private var framesOn = false
+    private var frameBuf: [UInt8] = []
+    private var lastFrameShown: CFTimeInterval = 0
+    private var frameFile: UnsafeMutablePointer<FILE>?
+    private let frameQueue = DispatchQueue(label: "es.fxgam.steamac.perf-frames", qos: .utility)
+    private var frameTimer: DispatchSourceTimer?
     private var lastShown: CFTimeInterval = 0
     private var vsyncBase: CFTimeInterval = 0
     private var vsyncPeriod: CFTimeInterval = 0
@@ -52,6 +73,14 @@ final class PerfStats {
         os_unfair_lock_lock(&lock)
         body()
         os_unfair_lock_unlock(&lock)
+    }
+
+    /// Per-frame values carried from the guest flush to the screen with the frame.
+    struct FrameStamp {
+        var flushedAt: CFTimeInterval = 0
+        var flushMs: Double = 0
+        var copyMs: Double = 0
+        var uploadMs: Double = 0
     }
 
     /// Main thread: start / stop collecting and reporting.
@@ -74,7 +103,8 @@ final class PerfStats {
         t.resume()
         timer = t
         if let view { attach(view: view) }
-        log("perf: stats every \(Int(PerfStats.period)) s (intervals in ms; >25/>50 = intervals longer than that)")
+        startFrames()
+        perfLog("perf: stats every \(Int(PerfStats.period)) s (intervals in ms; >25/>50 = intervals longer than that)")
     }
 
     private func stop() {
@@ -82,7 +112,49 @@ final class PerfStats {
         timer = nil
         displayLink?.invalidate()
         displayLink = nil
-        log("perf: stats off")
+        stopFrames()
+        perfLog("perf: stats off")
+    }
+
+    /// Main thread: STEAMAC_PERF_FRAMES=<path> opens the per-frame CSV and starts its 1 s writer.
+    private func startFrames() {
+        guard let path = ProcessInfo.processInfo.environment["STEAMAC_PERF_FRAMES"], !path.isEmpty else { return }
+        let opened: Bool = frameQueue.sync {
+            guard let f = fopen(path, "a") else { return false }
+            fseek(f, 0, SEEK_END)
+            if ftell(f) == 0 { fputs("t_ns,flush_ms,shown_ms,copy_ms,upload_ms,vsyncs\n", f) }
+            frameFile = f
+            return true
+        }
+        guard opened else { perfLog("perf: STEAMAC_PERF_FRAMES: cannot open \(path)"); return }
+        let t = DispatchSource.makeTimerSource(queue: frameQueue)
+        t.schedule(deadline: .now() + 1, repeating: 1)
+        t.setEventHandler { [weak self] in self?.writeFrames() }
+        t.resume()
+        frameTimer = t
+        locked { lastFrameShown = 0; framesOn = true }
+        perfLog("perf: per-frame export to \(path)")
+    }
+
+    /// Main thread: stop accepting frames, write what is buffered, close the file.
+    private func stopFrames() {
+        guard let t = frameTimer else { return }
+        locked { framesOn = false }
+        frameTimer = nil
+        t.cancel()
+        frameQueue.sync {
+            writeFrames()
+            if let f = frameFile { fclose(f); frameFile = nil }
+        }
+    }
+
+    /// frameQueue: drain the line buffer into the file.
+    private func writeFrames() {
+        var out: [UInt8] = []
+        locked { swap(&out, &frameBuf) }
+        guard !out.isEmpty, let f = frameFile else { return }
+        out.withUnsafeBufferPointer { _ = fwrite($0.baseAddress, 1, $0.count, f) }
+        fflush(f)
     }
 
     /// Main thread: follow the refreshes of the display showing `view` (while stats are on).
@@ -115,41 +187,58 @@ final class PerfStats {
         let now = CACurrentMediaTime()
         locked {
             flushTimes.append(now)
-            if allocAt > 0 { copyMs.append((now - allocAt) * 1000) }
+            let copy = allocAt > 0 ? (now - allocAt) * 1000 : 0
+            if allocAt > 0 { copyMs.append(copy) }
+            lastCopyMs = copy
             allocAt = 0
+            if lastFlushAt > 0 { lastFlushDeltaMs = (now - lastFlushAt) * 1000 }
             lastFlushAt = now
         }
     }
 
     // Main thread.
-    /// The flush time of the frame the presenter just took (the latest flush).
-    func frameTaken() -> CFTimeInterval {
-        var t: CFTimeInterval = 0
-        locked { taken += 1; t = lastFlushAt }
-        return t
+    /// The flush the presenter just took (the latest one), with its per-frame values.
+    func frameTaken() -> FrameStamp {
+        var s = FrameStamp()
+        locked {
+            taken += 1
+            s.flushedAt = lastFlushAt; s.flushMs = lastFlushDeltaMs; s.copyMs = lastCopyMs
+        }
+        return s
     }
 
     func uploaded(ms: Double) { locked { uploadMs.append(ms) } }
     func waitedForDrawable(ms: Double) { locked { drawableWaitMs.append(ms) } }
 
     // Metal completion thread: the drawable's command buffer completed.
-    func rendered(flushedAt: CFTimeInterval) {
+    func rendered(_ stamp: FrameStamp) {
         let now = CACurrentMediaTime()
         locked {
             var shown = now
+            var refreshes = 0
             if vsyncPeriod > 0 {
                 shown = vsyncBase + (((now - vsyncBase) / vsyncPeriod).rounded(.up)) * vsyncPeriod
                 let prev = shownTimes.last ?? lastShown
                 if prev > 0 {
                     // One new drawable per refresh at most: a second one waits for the next.
                     if shown < prev + vsyncPeriod / 2 { shown = prev + vsyncPeriod }
-                    let refreshes = Int(((shown - prev) / vsyncPeriod).rounded())
+                    refreshes = Int(((shown - prev) / vsyncPeriod).rounded())
                     refreshesPerFrame[refreshes, default: 0] += 1
                 }
             }
+            if framesOn { appendFrame(shown: shown, refreshes: refreshes, stamp: stamp) }
             shownTimes.append(shown)
-            if flushedAt > 0 { latencyMs.append((shown - flushedAt) * 1000) }
+            if stamp.flushedAt > 0 { latencyMs.append((shown - stamp.flushedAt) * 1000) }
         }
+    }
+
+    /// Under `lock` (Metal thread): one CSV line into the buffer; the writer drains it.
+    private func appendFrame(shown: CFTimeInterval, refreshes: Int, stamp: FrameStamp) {
+        let shownMs = lastFrameShown > 0 ? (shown - lastFrameShown) * 1000 : 0
+        lastFrameShown = shown
+        let line = String(format: "%llu,%.3f,%.3f,%.3f,%.3f,%ld\n",
+                          UInt64(max(0, shown) * 1e9), stamp.flushMs, shownMs, stamp.copyMs, stamp.uploadMs, refreshes)
+        frameBuf.append(contentsOf: line.utf8)
     }
 
     private func report() {
@@ -186,7 +275,7 @@ final class PerfStats {
         line += " lat p50/p99=\(PerfStats.f(PerfStats.pct(lat, 50)))/\(PerfStats.f(PerfStats.pct(lat, 99)))"
         line += " replaced=\(max(0, flushes.count - took))"
         line += " upload avg/max=\(PerfStats.avgMax(up)) drawable-wait max=\(PerfStats.f(wait.max() ?? 0))"
-        log(line)
+        perfLog(line)
     }
 
     private static func f(_ v: Double) -> String { String(format: "%.1f", v) }
@@ -207,4 +296,13 @@ final class PerfStats {
         guard !v.isEmpty else { return "0.0/0.0" }
         return "\(f(v.reduce(0, +) / Double(v.count)))/\(f(v.max()!))"
     }
+}
+
+/// Perf lines carry an ISO8601 wall-clock prefix (local offset) ahead of "[steamac-vm] perf:", so
+/// they align with guest samples. The "] perf: " marker stays intact for the support report filter.
+func perfLog(_ message: String) {
+    let stamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current,
+                                            formatOptions: [.withInternetDateTime, .withFractionalSeconds])
+    LogOutput.write("\(stamp) [steamac-vm] \(message)\n")
+    CrashReporting.logged(message)
 }

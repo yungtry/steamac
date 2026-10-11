@@ -1,0 +1,74 @@
+#!/bin/bash
+# steamac: launcher Settings > Advanced "Frame latency" (kernel command line steamac.frame_latency=1)
+# for the Vulkan graphics path.
+#
+# With it on, DXVK lets the CPU run at most one frame ahead of the GPU (DXVK's stock option
+# dxgi.maxFrameLatency = 1), which trades some throughput for lower input latency. It is written
+# into the guest's DXVK config, so no game needs a launch option or its own settings changed.
+#
+# The config file is $DXVK_CONFIG_FILE when one is set for the game, else $HOME/vrc/dxvk.conf (the
+# fork's VRChat setup and the lean run scripts point DXVK_CONFIG_FILE there). Only the two lines this
+# script writes (marked) are added or removed; everything else in the file is left byte for byte. A
+# dxvk.conf that already sets dxgi.maxFrameLatency is respected and never duplicated.
+#
+# Off (or no steamac.frame_latency=) removes only this script's lines: the default stays unchanged.
+# ExecStartPre of steam.service (Steam is not running then). Idempotent.
+# Test overrides: STEAMAC_CMDLINE, STEAMAC_HOME, DXVK_CONFIG_FILE.
+set -euo pipefail
+
+cmdline=${STEAMAC_CMDLINE:-/proc/cmdline}
+home=${STEAMAC_HOME:-/home/steamos}
+conf=${DXVK_CONFIG_FILE:-$home/vrc/dxvk.conf}
+marker="# steamac frame latency (steamac.frame_latency): dxgi.maxFrameLatency = 1"
+
+on=0
+for w in $(cat "$cmdline" 2>/dev/null); do
+    case $w in steamac.frame_latency=1) on=1 ;; esac
+done
+
+# The file without the block this script writes: the marker line and the option line after it.
+body=$(mktemp)
+tmp=
+trap 'rm -f "$body" ${tmp:+"$tmp"}' EXIT
+if [[ -e $conf ]]; then
+    awk -v m="$marker" 'skip > 0 { skip--; next } $0 == m { skip = 1; next } { print }' "$conf" > "$body"
+fi
+
+# A dxvk.conf that already sets the option (even to 0) is the game's own choice: respect it.
+sets_it=0
+if grep -Eq '^[[:space:]]*dxgi\.maxFrameLatency[[:space:]]*=' "$body"; then sets_it=1; fi
+ours=0
+if [[ -e $conf ]] && grep -qxF "$marker" "$conf"; then ours=1; fi
+
+want=0
+if [[ $on == 1 && $sets_it == 0 ]]; then want=1; fi
+
+if [[ ! -e $conf && $want == 0 ]]; then
+    echo "steam-frame-latency: no $conf and frame latency off; nothing to do" >&2
+    exit 0
+fi
+if [[ $want == 0 && $ours == 0 ]]; then
+    echo "steam-frame-latency: frame latency off, $conf is not ours; leaving it" >&2
+    exit 0
+fi
+
+mkdir -p "${conf%/*}"
+tmp=$(mktemp "$conf.XXXXXX")
+cp "$body" "$tmp"
+if [[ $want == 1 ]]; then
+    printf '%s\n' "$marker" >> "$tmp"
+    printf 'dxgi.maxFrameLatency = 1\n' >> "$tmp"
+fi
+if cmp -s "$tmp" "$conf"; then
+    rm -f "$tmp"; tmp=
+    echo "steam-frame-latency: $conf already correct (frame latency $([[ $on == 1 ]] && echo on || echo off))" >&2
+    exit 0
+fi
+# keep the file's mode; guest coreutils has --reference, the Mac dev box used for the test does not
+if [[ -e $conf ]]; then chmod --reference="$conf" "$tmp" 2>/dev/null || chmod 0644 "$tmp"; else chmod 0644 "$tmp"; fi
+mv -f "$tmp" "$conf"; tmp=
+if [[ $want == 1 ]]; then
+    echo "steam-frame-latency: dxgi.maxFrameLatency = 1 in $conf (frame latency on)" >&2
+else
+    echo "steam-frame-latency: removed the steamac frame-latency block from $conf (default)" >&2
+fi

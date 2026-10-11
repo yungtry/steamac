@@ -31,7 +31,7 @@ final class WindowController: NSObject, NSWindowDelegate {
     private var subscriptions: [AnyCancellable] = []
     /// FX boot/shutdown overlay, layered over the Metal view.
     let overlay: OverlayView
-    /// "Still working" card shown when the guest GPU goes idle (StallMonitor), above the overlay.
+    /// "Loading…" card shown when the guest GPU goes idle (StallMonitor), above the overlay.
     let stallView: StallIndicatorView
     private var stall: StallMonitor?
     /// Compact boot / shutdown progress while the full overlay is not up before `ready`, and the
@@ -82,6 +82,12 @@ final class WindowController: NSObject, NSWindowDelegate {
     /// `pixelScale`.
     var onGuestSizeRequest: ((Int, Int) -> Void)?
     private var requestedGuestSize: (Int, Int)
+    /// Guest display size at boot: the target while the guest does not follow the window.
+    private let bootGuestSize: (Int, Int)
+    /// The focused game's window size in guest pixels (`game-size`, progress agent); nil outside game focus.
+    private var focusedGameSize: (Int, Int)?
+    /// MetalFX factor limit per axis while a lower game resolution is shown (above it: bilinear).
+    static let lowResMetalFXMaxRatio = 1.5
     private var guestResizeWork: DispatchWorkItem?
     private var inFullScreenTransition = false
     static let minGuestSize = NSSize(width: 800, height: 500)
@@ -106,6 +112,7 @@ final class WindowController: NSObject, NSWindowDelegate {
         let guest = WindowController.guestSize(points: CGSize(width: width, height: height), scale: pixelScale)
         self.scanoutSize = guest
         self.requestedGuestSize = guest
+        self.bootGuestSize = guest
         let rect = NSRect(x: 0, y: 0, width: width, height: height)
         let screen = WindowController.targetScreen()
         window = NSWindow(contentRect: rect, styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -174,6 +181,9 @@ final class WindowController: NSObject, NSWindowDelegate {
         subscriptions.append(settings.$superResolution.dropFirst().removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] on in
             self?.applySuperResolution(on)
         })
+        subscriptions.append(settings.$upscaleLowerResolutions.dropFirst().removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] _ in
+            self?.refreshLowerResolution()
+        })
     }
 
     func show() {
@@ -211,6 +221,42 @@ final class WindowController: NSObject, NSWindowDelegate {
     func scanoutResized(width: Int, height: Int) {
         view.contentPixelSize = CGSize(width: width, height: height)
         scanoutSize = (width, height)
+        updateUpscaleCap()
+        view.redraw()
+    }
+
+    /// Lower game resolution (Settings > Display > "Upscale lower game resolutions"): the guest
+    /// game's own window size as reported by the progress agent. Nil = unknown / not in game focus.
+    func guestGameSize(width: Int, height: Int) {
+        focusedGameSize = (width & ~1, height & ~1)
+        log("display: focused game renders \(width)x\(height)")
+        refreshLowerResolution()
+    }
+
+    /// The guest display size wanted now: the window's (the boot size when it does not follow the
+    /// window), or the focused game's own size while that is smaller than it on both axes and the
+    /// setting is on. The window never changes for it: the Mac upscales the smaller picture.
+    func desiredGuestSize() -> (Int, Int) {
+        let base = settings.followWindowSize ? guestSizeForWindow() : bootGuestSize
+        guard settings.upscaleLowerResolutions, focusedGame != nil, let g = focusedGameSize,
+              g != base, g.0 >= 320, g.1 >= 200, g.0 <= base.0, g.1 <= base.1 else { return base }
+        return g
+    }
+
+    /// Re-evaluate the lower-resolution mode after a focus, game size or setting change.
+    private func refreshLowerResolution() {
+        updateUpscaleCap()
+        scheduleGuestResize()
+    }
+
+    /// MetalFX up to `lowResMetalFXMaxRatio` per axis only while the shown scanout is the focused
+    /// game's own size with the setting on; nil otherwise (the renderer's existing path, unchanged).
+    private func updateUpscaleCap() {
+        let lower = settings.upscaleLowerResolutions && focusedGame != nil
+            && focusedGameSize.map { $0 == scanoutSize } == true
+        let cap: Double? = lower ? WindowController.lowResMetalFXMaxRatio : nil
+        guard view.renderer.upscaleCap != cap else { return }
+        view.renderer.upscaleCap = cap
         view.redraw()
     }
 
@@ -241,10 +287,12 @@ final class WindowController: NSObject, NSWindowDelegate {
     /// meanwhile); fires once the size has been stable for `guestResizeDebounce`.
     private func scheduleGuestResize() {
         guestResizeWork?.cancel()
-        guard settings.followWindowSize else { return }
+        // Also while a lower game size is shown: turning the option off must send the boot size back.
+        guard settings.followWindowSize || settings.upscaleLowerResolutions || requestedGuestSize != bootGuestSize
+        else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.window.inLiveResize, !self.inFullScreenTransition, !self.holdGuestSize else { return }
-            let size = self.guestSizeForWindow()
+            let size = self.desiredGuestSize()
             guard size != self.requestedGuestSize else { return }
             self.requestedGuestSize = size
             self.onGuestSizeRequest?(size.0, size.1)
@@ -275,7 +323,7 @@ final class WindowController: NSObject, NSWindowDelegate {
     func windowDidFailToExitFullScreen(_ window: NSWindow) { inFullScreenTransition = false }
 
     func setStatus(_ status: String?) {
-        let title = status.map { "\(baseTitle) — \($0)" } ?? baseTitle
+        let title = status.map { String(localized: "\(baseTitle) — \($0)", comment: "Window title: app name and current status") } ?? baseTitle
         if window.title != title { window.title = title }
     }
 
@@ -283,15 +331,15 @@ final class WindowController: NSObject, NSWindowDelegate {
     /// ("Downloading Steam update 70%", "Starting Steam…", "Shutting down…").
     private func updateTitle() {
         if guestAsleep {
-            setStatus("sleeping — click to wake")
+            setStatus(String(localized: "sleeping — click to wake"))
         } else if pausedGame != nil {
-            setStatus("paused")
+            setStatus(String(localized: "paused", comment: "Window status: the game is paused"))
         } else if let s = progress.flatMap({ WindowController.progressStatus($0.state) }) {
-            setStatus(captured ? "\(s) — mouse captured, Ctrl+Option releases" : s)
+            setStatus(captured ? String(localized: "\(s) — mouse captured, Ctrl+Option releases") : s)
         } else if captured {
-            setStatus("mouse captured — Ctrl+Option releases")
+            setStatus(String(localized: "mouse captured — Ctrl+Option releases"))
         } else if inputs != nil && clickCaptures {
-            setStatus("click to capture the mouse")
+            setStatus(String(localized: "click to capture the mouse"))
         } else {
             setStatus(nil)
         }
@@ -306,7 +354,7 @@ final class WindowController: NSObject, NSWindowDelegate {
         case .boot:
             guard !s.indeterminate, s.fraction > 0 else { return ellipsized }
             let t = s.title.hasSuffix("…") ? String(s.title.dropLast()) : s.title
-            return "\(t) \(Int((s.fraction * 100).rounded(.down)))%"
+            return String(localized: "\(t) \(Int((s.fraction * 100).rounded(.down)))%")
         }
     }
 
@@ -357,6 +405,7 @@ final class WindowController: NSObject, NSWindowDelegate {
         progress.onChange = { [weak self] s in previous?(s); self?.progressChanged(s) }
         let previousFocus = progress.onFocus
         progress.onFocus = { [weak self] f in previousFocus?(f); self?.guestFocusChanged(f) }
+        progress.onGameSize = { [weak self] w, h in self?.guestGameSize(width: w, height: h) }
         let previousReady = progress.onReady
         progress.onReady = { [weak self] in previousReady?(); self?.overlay.hide() }
         let previousShutdown = progress.onShutdown
@@ -693,9 +742,11 @@ final class WindowController: NSObject, NSWindowDelegate {
         return CGRect(x: fit.midX - pw / 2, y: fit.midY - ph / 2, width: pw, height: ph)
     }
 
-    /// "Name (appid)" when the guest told us the game's name.
+    /// "Name (appid)" when the guest told us the game's name. IDs are interpolated as text: an
+    /// Int would be grouped like a quantity ("1 091 500").
     private func gameLabel(_ id: Int) -> String {
-        settings.gameName(id).map { "\($0) (\(id))" } ?? "game \(id)"
+        settings.gameName(id).map { String(localized: "\($0) (\(String(id)))", comment: "Game name and Steam app ID") }
+            ?? String(localized: "game \(String(id))")
     }
 
     private var focusedGame: Int? {
@@ -719,16 +770,20 @@ final class WindowController: NSObject, NSWindowDelegate {
         }
         guard f != guestFocus else { return }
         guestFocus = f
+        // The agent sends the new game's `game-size` right after `focus game`; until then none is known.
+        focusedGameSize = nil
+        view.gameLayersVisible = focusedGame != nil
         stall?.gameFocused = focusedGame != nil
         updateNoPictureGate()
         log("input: guest focus \(f)")
+        refreshLowerResolution()
         guestCursor = nil
         // Back in Steam / desktop (or a game without auto-capture): give the pointer back.
         if captured && mouseMode == .auto && !clickCaptures { releasePointer() }
         updateTitle()
         if let id = focusedGame, mouseMode == .auto {
-            flashStatus(settings.autoCapture(for: id) ? "click to capture the mouse (Ctrl+Option releases)"
-                                                      : "auto-capture off for \(gameLabel(id)) (Ctrl+Cmd+G captures)")
+            flashStatus(settings.autoCapture(for: id) ? String(localized: "click to capture the mouse (Ctrl+Option releases)")
+                                                      : String(localized: "auto-capture off for \(gameLabel(id)) (Ctrl+Cmd+G captures)"))
         }
     }
 
@@ -749,7 +804,8 @@ final class WindowController: NSObject, NSWindowDelegate {
         settings.setAutoCapture(on, for: id)
         if !on && captured { releasePointer() }
         updateTitle()
-        flashStatus(on ? "auto-capture on for \(gameLabel(id))" : "auto-capture off for \(gameLabel(id))")
+        flashStatus(on ? String(localized: "auto-capture on for \(gameLabel(id))")
+                       : String(localized: "auto-capture off for \(gameLabel(id))"))
     }
 
     @objc func toggleGlobalAutoCapture(_ sender: Any?) {
@@ -759,7 +815,8 @@ final class WindowController: NSObject, NSWindowDelegate {
             + (settings.autoCaptureOverride != nil ? "; --auto-capture still applies to this run" : ""))
         if captured && !clickCaptures { releasePointer() }
         updateTitle()
-        flashStatus("auto-capture in games \(settings.globalAutoCapture ? "on" : "off")")
+        flashStatus(settings.globalAutoCapture ? String(localized: "auto-capture in games on")
+                                               : String(localized: "auto-capture in games off"))
     }
 
     @objc func toggleCaptureNow(_ sender: Any?) { captured ? releasePointer() : grabPointer() }
@@ -768,12 +825,15 @@ final class WindowController: NSObject, NSWindowDelegate {
     func installMouseMenu() {
         guard let main = NSApp.mainMenu else { return }
         let item = NSMenuItem()
-        let menu = NSMenu(title: "Mouse")
+        let menu = NSMenu(title: String(localized: "Mouse", comment: "Menu for mouse capture controls"))
         menu.autoenablesItems = true
-        for (title, action) in [("Capture Mouse in This Game", #selector(toggleGameAutoCapture(_:))),
-                                ("Auto-Capture Mouse in Games", #selector(toggleGlobalAutoCapture(_:))),
-                                ("Capture / Release Mouse Now (Ctrl+Cmd+G)", #selector(toggleCaptureNow(_:)))] {
-            let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        let entries: [(LocalizedStringResource, Selector)] = [
+            ("Capture Mouse in This Game", #selector(toggleGameAutoCapture(_:))),
+            ("Auto-Capture Mouse in Games", #selector(toggleGlobalAutoCapture(_:))),
+            ("Capture / Release Mouse Now (Ctrl+Cmd+G)", #selector(toggleCaptureNow(_:))),
+        ]
+        for (title, action) in entries {
+            let i = NSMenuItem(title: String(localized: title), action: action, keyEquivalent: "")
             i.target = self
             menu.addItem(i)
         }
@@ -787,11 +847,11 @@ extension WindowController: NSMenuItemValidation {
         switch item.action {
         case #selector(toggleGameAutoCapture(_:)):
             if let id = focusedGame {
-                item.title = "Capture Mouse in This Game (\(gameLabel(id)))"
+                item.title = String(localized: "Capture Mouse in This Game (\(gameLabel(id)))")
                 item.state = settings.autoCapture(for: id) ? .on : .off
                 return mouseMode == .auto
             }
-            item.title = "Capture Mouse in This Game"
+            item.title = String(localized: "Capture Mouse in This Game")
             item.state = .off
             return false
         case #selector(toggleGlobalAutoCapture(_:)):
@@ -1031,7 +1091,7 @@ enum MainMenu {
         appMenu.addItem(item("Report a Problem…", report, target))
         appMenu.addItem(.separator())
         // Ctrl+Cmd+S also works while the VM window has the keyboard (WindowController.processKey).
-        let suspendItem = item("Suspend", suspend, target, key: "s")
+        let suspendItem = item(LocalizedStringResource("Suspend", comment: "App menu: freeze the VM in memory"), suspend, target, key: "s")
         suspendItem.keyEquivalentModifierMask = [.command, .control]
         appMenu.addItem(suspendItem)
         appMenu.addItem(item("Restart VM", restart, target))
@@ -1040,18 +1100,18 @@ enum MainMenu {
         appMenu.addItem(.separator())
         // Lifecycle.applicationShouldTerminate decides (shut down; asks first while suspended).
         // While the VM window has the keyboard, Cmd+Q goes to the guest like every key.
-        appMenu.addItem(NSMenuItem(title: "Quit FX Steam Launcher", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenu.addItem(NSMenuItem(title: String(localized: "Quit FX Steam Launcher"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         addEditAndWindowMenus(main)
         let viewItem = NSMenuItem()
         main.insertItem(viewItem, at: 2)
-        let viewMenu = NSMenu(title: "View")
+        let viewMenu = NSMenu(title: String(localized: "View", comment: "Menu for display controls"))
         viewItem.submenu = viewMenu
         viewMenu.addItem(item("Toggle Full Screen (Ctrl+Cmd+F)", fullscreen, target))
         viewMenu.addItem(item("Grab Pointer (Ctrl+Cmd+G; Ctrl+Option releases)", grab, target))
         viewMenu.addItem(item("Show Boot Progress", overlay, target))
         // Ticked by the target's validateMenuItem (follows Settings > Display and Ctrl+Cmd+P).
         viewMenu.addItem(item("Show Metal Performance HUD (Ctrl+Cmd+P)", metalHUD, target))
-        let help = NSMenu(title: "Help")
+        let help = NSMenu(title: String(localized: "Help", comment: "Application help menu"))
         help.addItem(item("Report a Problem…", report, target))
         let helpItem = NSMenuItem()
         helpItem.submenu = help
@@ -1068,34 +1128,37 @@ enum MainMenu {
         let appMenu = NSMenu()
         appItem.submenu = appMenu
         if let (action, target) = settings { appMenu.addItem(item("Settings…", action, target, key: ",")) }
-        appMenu.addItem(NSMenuItem(title: "Quit FX Steam Launcher", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenu.addItem(NSMenuItem(title: String(localized: "Quit FX Steam Launcher"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         addEditAndWindowMenus(main)
         NSApp.mainMenu = main
     }
 
     /// Standard Edit (text fields in Settings) and Window (Cmd+W closes Settings) menus.
     private static func addEditAndWindowMenus(_ main: NSMenu) {
-        let edit = NSMenu(title: "Edit")
-        for (title, action, key) in [("Undo", Selector(("undo:")), "z"), ("Redo", Selector(("redo:")), "Z"),
-                                     ("Cut", #selector(NSText.cut(_:)), "x"), ("Copy", #selector(NSText.copy(_:)), "c"),
-                                     ("Paste", #selector(NSText.paste(_:)), "v"),
-                                     ("Select All", #selector(NSText.selectAll(_:)), "a")] {
-            edit.addItem(NSMenuItem(title: title, action: action, keyEquivalent: key))
+        let edit = NSMenu(title: String(localized: "Edit", comment: "Standard text editing menu"))
+        let entries: [(LocalizedStringResource, Selector, String)] = [
+            ("Undo", Selector(("undo:")), "z"), ("Redo", Selector(("redo:")), "Z"),
+            ("Cut", #selector(NSText.cut(_:)), "x"), ("Copy", #selector(NSText.copy(_:)), "c"),
+            ("Paste", #selector(NSText.paste(_:)), "v"),
+            ("Select All", #selector(NSText.selectAll(_:)), "a"),
+        ]
+        for (title, action, key) in entries {
+            edit.addItem(NSMenuItem(title: String(localized: title), action: action, keyEquivalent: key))
         }
         let editItem = NSMenuItem()
         editItem.submenu = edit
         main.addItem(editItem)
-        let window = NSMenu(title: "Window")
-        window.addItem(NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
-        window.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        let window = NSMenu(title: String(localized: "Window", comment: "Standard window management menu"))
+        window.addItem(NSMenuItem(title: String(localized: "Close", comment: "Menu command: close the window"), action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+        window.addItem(NSMenuItem(title: String(localized: "Minimize"), action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
         let windowItem = NSMenuItem()
         windowItem.submenu = window
         main.addItem(windowItem)
         NSApp.windowsMenu = window
     }
 
-    private static func item(_ title: String, _ action: Selector, _ target: AnyObject, key: String = "") -> NSMenuItem {
-        let i = NSMenuItem(title: title, action: action, keyEquivalent: key)
+    private static func item(_ title: LocalizedStringResource, _ action: Selector, _ target: AnyObject, key: String = "") -> NSMenuItem {
+        let i = NSMenuItem(title: String(localized: title), action: action, keyEquivalent: key)
         i.target = target
         return i
     }

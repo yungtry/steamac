@@ -12,13 +12,19 @@
 #                                       work/out/{Image,initramfs.cpio.gz,steamac-layer.img}; the
 #                                       host libraries are work/out/host/lib as they are now)
 #   scripts/test/vkd3d-tiled.sh run [TEST...]
-#                                       in the guest: vulkaninfo sparse/residency/minmax lines,
+#                                       in the guest: vulkaninfo sparse/residency/minmax lines, an
+#                                       assertion that the pipeline-library / vertex-input-dynamic
+#                                       extensions are absent (KosmicKrisp lacks them, so Venus filters
+#                                       them out and DXVK/vkd3d do full pipeline compiles),
 #                                       d3d12-caps, vk-minmax (sampler min/max reduction), then
 #                                       each vkd3d-proton test in its own process
 #                                       (default: the tiled-resource/min-LOD/min-max list below);
 #                                       results in $S/results-N/ (summary.txt + one log per test)
 #   scripts/test/vkd3d-tiled.sh stop    shut the VM down
 #   scripts/test/vkd3d-tiled.sh clean   stop, delete $S/vm (the disk); keeps the build
+#   scripts/test/vkd3d-tiled.sh selftest
+#                                       offline check of the pipeline-library assertion (synthetic
+#                                       vulkaninfo output); no VM, no disk, no game
 #
 # Env: S (default work/scratch/vkd3d-tiled), SSH_PORT (default 2241), VULKAN_DRIVER
 # (kosmickrisp|moltenvk, default kosmickrisp), TEST_TIMEOUT (s per test, default 300),
@@ -41,6 +47,46 @@ TESTS_DEFAULT=(
     test_texture_feedback_instructions_sm51 test_texture_feedback_instructions_dxil
     test_view_min_lod test_create_sampler
 )
+
+# check_pipeline_library <vulkaninfo-output-file>: DXVK/vkd3d compile each pipeline in full unless the
+# pipeline-library extensions are advertised. Venus does advertise EXT_graphics_pipeline_library and
+# EXT_vertex_input_dynamic_state, but KosmicKrisp does not implement them, and Venus keeps a passthrough
+# extension only when the host reports it (vn_physical_device_init_supported_extensions), so the guest
+# must NOT see these names. Prints "ok:" and returns 0 when absent, prints "FAIL:" and returns 1 when
+# present (a change there means the host driver gained the extension and DXVK's fast path may be reachable).
+check_pipeline_library() {
+    local exts
+    exts=$(grep -iE 'VK_(EXT_graphics_pipeline_library|KHR_pipeline_library|EXT_pipeline_library_group_handles|EXT_vertex_input_dynamic_state)' "$1" || true)
+    if [[ -z $exts ]]; then
+        echo "ok: VK_EXT_graphics_pipeline_library / VK_KHR_pipeline_library / VK_EXT_vertex_input_dynamic_state absent (Vulkan) -> DXVK full pipeline compiles"
+        return 0
+    fi
+    echo "FAIL: guest advertises pipeline-library extension(s) (DXVK's fast-pipeline path may now be reachable):"
+    printf '%s\n' "$exts"
+    return 1
+}
+
+# selftest: exercise check_pipeline_library on synthetic vulkaninfo output, offline (no VM, no game).
+selftest() {
+    local d rc=0
+    d=$(mktemp -d)
+    cat > "$d/absent" <<'EOF'
+	VK_EXT_extended_dynamic_state3          : extension revision 2
+	VK_EXT_pipeline_creation_feedback       : extension revision 1
+	VK_EXT_vertex_attribute_divisor         : extension revision 3
+EOF
+    cat > "$d/present" <<'EOF'
+	VK_EXT_extended_dynamic_state3          : extension revision 2
+	VK_EXT_graphics_pipeline_library        : extension revision 1
+	VK_EXT_vertex_input_dynamic_state       : extension revision 2
+EOF
+    if check_pipeline_library "$d/absent" | grep -q '^ok:'; then echo "ok   absent -> claimed absent"
+    else echo "FAIL absent -> not claimed absent"; rc=1; fi
+    if check_pipeline_library "$d/present" > /dev/null; then echo "FAIL present -> claimed absent"; rc=1
+    else echo "ok   present -> reported as advertised"; fi
+    rm -rf "$d"
+    exit $rc
+}
 
 ssh_g() {
     sshpass -p "${STEAMOS_PASSWORD:-steamos}" ssh -q -p "$PORT" -o StrictHostKeyChecking=no \
@@ -142,6 +188,18 @@ run() {
         echo "== vulkaninfo"
         ssh_g 'vulkaninfo 2>/dev/null' | grep -E 'deviceName|driverName|driverInfo|apiVersion|sparse|[Rr]esidency|shaderResourceMinLod|filterMinmax|minLod|shaderStorageImageReadWithoutFormat|SPARSE_BINDING' \
             | sed 's/^[[:space:]]*//' | sort | uniq -c | sed 's/^ *1 //'
+        # DXVK/vkd3d fall back to full, synchronous pipeline compiles (the stutter) unless the
+        # pipeline-library extensions are advertised. Venus does advertise EXT_graphics_pipeline_library
+        # and EXT_vertex_input_dynamic_state, but KosmicKrisp does not implement them: Venus filters
+        # passthrough extensions against the host with vkEnumerateDeviceExtensionProperties
+        # (vn_physical_device_init_supported_extensions), so the guest must NOT see them. Assert it;
+        # a change here means the host driver gained them and DXVK's fast path may now be reachable.
+        echo "== pipeline-library advertisement (expect none)"
+        local vin
+        vin=$(mktemp)
+        ssh_g 'vulkaninfo 2>/dev/null' > "$vin"
+        check_pipeline_library "$vin" || true
+        rm -f "$vin"
         echo "== d3d12-caps"
         ssh_g "cd ~/vkd3d-tiled && ${GUEST_ENV:-} VKD3D_SHADER_CACHE_PATH=0 LD_LIBRARY_PATH=. ./d3d12-caps 2>&1" || echo "(exit $?)"
         echo "== vk-minmax"
@@ -175,7 +233,8 @@ case ${1:-} in
     disk) disk ;;
     start) start ;;
     run) shift; run "$@" ;;
+    selftest) selftest ;;
     stop) stop ;;
     clean) stop; rm -rf "$S/vm" ;;
-    *) sed -n '2,26p' "$0"; exit 2 ;;
+    *) sed -n '2,30p' "$0"; exit 2 ;;
 esac

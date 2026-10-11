@@ -1,0 +1,380 @@
+From 618d592e45d2d3d3526d7a185579c3a4c2d63331 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Sun, 11 Oct 2026 01:38:12 +0300
+Subject: [PATCH] virtio-snd: recover from a failed control request and give the AudioUnit start room under load
+
+Seen live on merge-1.9 (lean runs A_N19_DX20 / A_N19_VK20): "prepare took more than 2s;
+failing it so the guest recovers", then 100+ guest lines "SID 0: invalid I/O queue state"
+and lower fps; the 1.8.2 + 0021 runs had none.
+
+Cause (offline): the 2 s control deadline of 0021/0022 fired on a PREPARE under load, and
+the failure left the stream's queued I/O held by the device. The guest driver refuses
+PREPARE while any of its I/O messages is in flight and the device only completes held
+messages at PREPARE (or once playing), so nothing could ever release them: the storm.
+It is not slow code: with the real default output device, an idle Mac does
+configure/start/stop/release in 2-30 ms (real_device_cycle_timing, ignored test) and
+output_route() in 0.2 ms; upstream's multichannel route code does not change that. The
+runs were under memory/CPU pressure with the game's audio already underrunning, where a
+HAL start can take seconds.
+
+Upstream state (libkrun 1.19.6 + steamac 0017): no control deadline exists upstream; this
+is our own 0022 mechanism.
+
+Changes (CoreAudio backend):
+* CTL_DEADLINE 2 s -> 8 s: a rescue for a call that never returns, not a latency target;
+  still below the launcher's virtio_snd.msg_timeout_ms of 10 s.
+* PREPARE/START/RELEASE that fail (including the deadline) complete the stream's queued
+  I/O with IO_ERR (Inner::fail_stream_io), so the guest's next PREPARE is accepted.
+* A unit request slower than 250 ms logs where the time went (unit calls, waiting for the
+  pump's lock, latency refresh), so the next live run shows whether coreaudiod or the pump
+  was slow.
+
+Tests (cargo test --features gpu,snd --lib -- virtio::snd, 22 pass): a failed PREPARE
+releases the queued I/O (fails with the recovery disabled); the deadline leaves room for a
+loaded HAL; the existing stuck-pump tests still pass. real_device_cycle_timing is an
+ignored manual timing of the real device.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+
+---
+ .../virtio/snd/audio_backends/coreaudio.rs    | 248 ++++++++++++++----
+ 1 file changed, 195 insertions(+), 53 deletions(-)
+
+diff --git a/src/devices/src/virtio/snd/audio_backends/coreaudio.rs b/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
+index b7b83e7..250e4dc 100644
+--- a/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
++++ b/src/devices/src/virtio/snd/audio_backends/coreaudio.rs
+@@ -344,10 +344,15 @@ const RING_BYTES: usize = 1 << 20;
+ const CAPTURE_MAX_FRAMES: usize = 16384;
+ const HOUSEKEEPING: Duration = Duration::from_secs(1);
+ /// A control request (PREPARE, START, RELEASE, STOP) is answered, with an error if need be,
+-/// within this long. It must stay below the guest driver's virtio_snd.msg_timeout_ms (the
+-/// launcher sets 10 s; the kernel default is 1 s).
+-const CTL_DEADLINE: Duration = Duration::from_secs(2);
++/// within this long. It is a rescue for a CoreAudio call that does not return, not a latency
++/// target: under load (a starved coreaudiod, memory pressure) a healthy AudioUnit start takes
++/// seconds, and failing it early only makes the guest tear the stream down and retry. It must
++/// stay below the guest driver's virtio_snd.msg_timeout_ms (the launcher sets 10 s; the kernel
++/// default is 1 s).
++const CTL_DEADLINE: Duration = Duration::from_secs(8);
+ /// The pump thread has made no progress for this long: queued I/O is failed (see `watchdog_thread`).
++/// A unit request slower than this is logged with where the time went.
++const SLOW_UNIT_JOB: Duration = Duration::from_millis(250);
+ const IO_STALL: Duration = Duration::from_secs(3);
+ const WATCHDOG_PERIOD: Duration = Duration::from_millis(250);
+ /// Non-zero status the converter input proc returns when the ring has no more frames now.
+@@ -1781,9 +1786,8 @@ impl UnitSlot {
+         if self.unit.is_some() {
+             return Ok(());
+         }
+-        let route = output_route(control).ok_or_else(|| {
+-            Error::UnexpectedAudioBackendError("no usable output device".into())
+-        })?;
++        let route = output_route(control)
++            .ok_or_else(|| Error::UnexpectedAudioBackendError("no usable output device".into()))?;
+         let unit = Unit::new(kAudioUnitSubType_HALOutput)?;
+         unit.set(
+             kAudioOutputUnitProperty_CurrentDevice,
+@@ -2669,6 +2673,16 @@ impl Inner {
+ 
+     /// Complete every queued I/O message with IO_ERR, without `hosts`. Returns how many.
+     fn fail_io(&self) -> usize {
++        (0..self.shareds.len())
++            .map(|id| self.fail_stream_io(id))
++            .sum()
++    }
++
++    /// Complete the queued I/O messages of one stream with IO_ERR, without `hosts`. Returns how
++    /// many. The guest driver refuses PREPARE while any of its messages is in flight, and the
++    /// device only completes held messages at PREPARE (or START and playback): after a failed
++    /// control request nothing else would ever release them.
++    fn fail_stream_io(&self, id: usize) -> usize {
+         let mut failed = 0;
+         let fail = |buf: Buffer| {
+             buf.message
+@@ -2676,13 +2690,11 @@ impl Inner {
+                 .store(VIRTIO_SND_S_IO_ERR, Ordering::SeqCst);
+             buf.message.latency_bytes.store(0, Ordering::Relaxed);
+         };
+-        for shared in &self.shareds {
+-            for (_, buf) in shared.inflight.lock().unwrap().drain(..) {
+-                fail(buf);
+-                failed += 1;
+-            }
++        for (_, buf) in self.shareds[id].inflight.lock().unwrap().drain(..) {
++            fail(buf);
++            failed += 1;
+         }
+-        for stream in self.streams.write().unwrap().iter_mut() {
++        if let Some(stream) = self.streams.write().unwrap().get_mut(id) {
+             for buf in stream.buffers.drain(..) {
+                 fail(buf);
+                 failed += 1;
+@@ -2882,13 +2894,25 @@ impl CoreAudioBackend {
+         let spawned = std::thread::Builder::new()
+             .name(format!("virtio-snd unit {id}"))
+             .spawn(move || {
++                let started = Instant::now();
+                 let result = job(&mut slot, &shared, &control);
+-                {
+-                    let mut hosts = inner.hosts.lock().unwrap();
+-                    let host = &mut hosts[id];
+-                    host.slot = slot;
+-                    host.unit_busy = false;
+-                    host.update_latency();
++                let worked = started.elapsed();
++                let mut hosts = inner.hosts.lock().unwrap();
++                let locked = started.elapsed();
++                let host = &mut hosts[id];
++                host.slot = slot;
++                host.unit_busy = false;
++                host.update_latency();
++                drop(hosts);
++                let total = started.elapsed();
++                if total >= SLOW_UNIT_JOB {
++                    // Which of the three steps was slow tells a stalled coreaudiod from a stuck pump.
++                    log::warn!(
++                        "snd: stream {id}: {what} took {total:?}: unit calls {worked:?}, then {:?} \
++                         for the pump's lock, {:?} refreshing the latency",
++                        locked - worked,
++                        total - locked
++                    );
+                 }
+                 let _ = tx.send(result);
+             });
+@@ -2977,42 +3001,21 @@ impl Drop for CoreAudioBackend {
+     }
+ }
+ 
+-impl AudioBackend for CoreAudioBackend {
+-    fn write(&self, _stream_id: u32) -> Result<()> {
+-        self.inner.wake.signal();
+-        Ok(())
+-    }
+-
+-    fn read(&self, _stream_id: u32) -> Result<()> {
+-        self.inner.wake.signal();
+-        Ok(())
+-    }
+-
+-    fn set_parameters(&self, stream_id: u32, request: VirtioSndPcmSetParams) -> Result<()> {
+-        let mut streams = self.inner.streams.write().unwrap();
+-        let st = streams
+-            .get_mut(stream_id as usize)
+-            .ok_or(Error::StreamWithIdNotFound(stream_id))?;
+-        if !st.supports_format(request.format)
+-            || !st.supports_rate(request.rate)
+-            || !(st.channels_min..=st.channels_max).contains(&request.channels)
+-        {
+-            return Err(Error::UnexpectedAudioBackendConfiguration);
++impl CoreAudioBackend {
++    /// A failed control request leaves the guest's queued I/O held by the device, and the guest
++    /// driver refuses its next PREPARE ("invalid I/O queue state") while any is: complete it
++    /// with IO_ERR so the driver can start over.
++    fn recover(&self, stream_id: u32, result: Result<()>) -> Result<()> {
++        if result.is_err() {
++            let failed = self.inner.fail_stream_io(stream_id as usize);
++            if failed > 0 {
++                log::warn!("snd: stream {stream_id}: failed {failed} queued I/O messages after a failed control request");
++            }
+         }
+-        st.state.set_parameters().map_err(|err| {
+-            log::error!("snd: stream {stream_id} set_parameters: {err}");
+-            Error::Stream(err)
+-        })?;
+-        st.params.features = request.features;
+-        st.params.buffer_bytes = request.buffer_bytes;
+-        st.params.period_bytes = request.period_bytes;
+-        st.params.channels = request.channels;
+-        st.params.format = request.format;
+-        st.params.rate = request.rate;
+-        Ok(())
++        result
+     }
+ 
+-    fn prepare(&self, stream_id: u32) -> Result<()> {
++    fn do_prepare(&self, stream_id: u32) -> Result<()> {
+         self.transition(stream_id, "prepare", PCMState::Prepare, PCMState::prepare)?;
+         let (fmt, buffer) = {
+             let params = &self.inner.streams.read().unwrap()[stream_id as usize].params;
+@@ -3066,7 +3069,7 @@ impl AudioBackend for CoreAudioBackend {
+         Ok(())
+     }
+ 
+-    fn release(&self, stream_id: u32) -> Result<()> {
++    fn do_release(&self, stream_id: u32) -> Result<()> {
+         self.transition(stream_id, "release", PCMState::Release, PCMState::release)?;
+         let id = stream_id as usize;
+         // Playback: note what to drain, but never hold `hosts` across the wait (the pump thread
+@@ -3100,7 +3103,7 @@ impl AudioBackend for CoreAudioBackend {
+         Ok(())
+     }
+ 
+-    fn start(&self, stream_id: u32) -> Result<()> {
++    fn do_start(&self, stream_id: u32) -> Result<()> {
+         self.transition(stream_id, "start", PCMState::Start, PCMState::start)?;
+         let id = stream_id as usize;
+         let fmt = {
+@@ -3162,6 +3165,54 @@ impl AudioBackend for CoreAudioBackend {
+         self.inner.wake.signal();
+         Ok(())
+     }
++}
++
++impl AudioBackend for CoreAudioBackend {
++    fn write(&self, _stream_id: u32) -> Result<()> {
++        self.inner.wake.signal();
++        Ok(())
++    }
++
++    fn read(&self, _stream_id: u32) -> Result<()> {
++        self.inner.wake.signal();
++        Ok(())
++    }
++
++    fn set_parameters(&self, stream_id: u32, request: VirtioSndPcmSetParams) -> Result<()> {
++        let mut streams = self.inner.streams.write().unwrap();
++        let st = streams
++            .get_mut(stream_id as usize)
++            .ok_or(Error::StreamWithIdNotFound(stream_id))?;
++        if !st.supports_format(request.format)
++            || !st.supports_rate(request.rate)
++            || !(st.channels_min..=st.channels_max).contains(&request.channels)
++        {
++            return Err(Error::UnexpectedAudioBackendConfiguration);
++        }
++        st.state.set_parameters().map_err(|err| {
++            log::error!("snd: stream {stream_id} set_parameters: {err}");
++            Error::Stream(err)
++        })?;
++        st.params.features = request.features;
++        st.params.buffer_bytes = request.buffer_bytes;
++        st.params.period_bytes = request.period_bytes;
++        st.params.channels = request.channels;
++        st.params.format = request.format;
++        st.params.rate = request.rate;
++        Ok(())
++    }
++
++    fn prepare(&self, stream_id: u32) -> Result<()> {
++        self.recover(stream_id, self.do_prepare(stream_id))
++    }
++
++    fn release(&self, stream_id: u32) -> Result<()> {
++        self.recover(stream_id, self.do_release(stream_id))
++    }
++
++    fn start(&self, stream_id: u32) -> Result<()> {
++        self.recover(stream_id, self.do_start(stream_id))
++    }
+ 
+     fn stop(&self, stream_id: u32) -> Result<()> {
+         self.transition(stream_id, "stop", PCMState::Stop, PCMState::stop)?;
+@@ -3299,6 +3350,74 @@ mod tests {
+         }
+     }
+ 
++    /// Manual timing of the real CoreAudio calls a PREPARE/START/STOP/RELEASE cycle makes.
++    #[test]
++    #[ignore = "uses the real default output device"]
++    fn real_device_cycle_timing() {
++        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
++        let control = Arc::new(SndControl::default());
++        let t = Instant::now();
++        let _ = control.playback_maps();
++        eprintln!("playback_maps (first): {:.1} ms", ms(t));
++        for _ in 0..3 {
++            let t = Instant::now();
++            let route = output_route(&control);
++            eprintln!("output_route: {:.1} ms {:?}", ms(t), route.is_some());
++        }
++        let wake = Arc::new(Semaphore::new().unwrap());
++        let shared = Shared::new(Direction::Output, false, wake);
++        let fmt = Format {
++            format: VIRTIO_SND_PCM_FMT_S16,
++            rate: 48000,
++            channels: 2,
++        };
++        for round in 0..5 {
++            let mut slot = UnitSlot::default();
++            let t = Instant::now();
++            slot.configure(fmt, &shared, &control).unwrap();
++            let configure = ms(t);
++            let t = Instant::now();
++            slot.start(false).unwrap();
++            let start = ms(t);
++            std::thread::sleep(Duration::from_millis(300));
++            let t = Instant::now();
++            slot.stop();
++            let stop = ms(t);
++            let t = Instant::now();
++            drop(slot);
++            eprintln!(
++                "round {round}: configure {configure:.1} ms, start {start:.1} ms, stop {stop:.1} ms, drop {:.1} ms",
++                ms(t)
++            );
++        }
++        let backend = backend(Duration::from_secs(10), Duration::from_secs(60));
++        backend.inner.streams.write().unwrap()[0].state = PCMState::SetParameters;
++        for round in 0..5 {
++            let mut worst = (0.0f64, "");
++            for (what, op) in [
++                (
++                    "prepare",
++                    &(|| backend.prepare(0)) as &dyn Fn() -> Result<()>,
++                ),
++                ("start", &|| backend.start(0)),
++                ("stop", &|| backend.stop(0)),
++                ("release", &|| backend.release(0)),
++            ] {
++                let t = Instant::now();
++                op().unwrap();
++                let d = ms(t);
++                eprintln!("cycle {round} {what}: {d:.1} ms");
++                if d > worst.0 {
++                    worst = (d, what);
++                }
++                if what == "start" {
++                    std::thread::sleep(Duration::from_millis(300));
++                }
++            }
++            eprintln!("cycle {round} worst: {:.1} ms ({})", worst.0, worst.1);
++        }
++    }
++
+     /// The AudioUnit work of a control request runs without `hosts`: the pump keeps completing
+     /// the guest's I/O while a unit call is in flight. (Before: PREPARE/START ran
+     /// stop/configure/start under `hosts`, the pump waited, and the guest's messages stayed
+@@ -3385,6 +3504,29 @@ mod tests {
+         }
+     }
+ 
++    /// A control request that fails (here: the pump holds `hosts` past the deadline) completes
++    /// the stream's queued I/O with IO_ERR. Held, it would keep the guest's I/O queue busy and the
++    /// driver would refuse every further PREPARE with "invalid I/O queue state" while the device
++    /// waits for that PREPARE to flush it.
++    #[test]
++    fn failed_control_request_releases_the_guests_queued_io() {
++        let backend = Arc::new(backend(CTL, Duration::from_secs(60)));
++        let _stuck = StuckPump::new(&backend);
++        let message = queue_message(&backend);
++        assert!(backend.prepare(0).is_err());
++        assert!(completed(&message), "the failed PREPARE left I/O queued");
++        assert_eq!(message.status.load(Ordering::SeqCst), VIRTIO_SND_S_IO_ERR);
++    }
++
++    /// The deadline rescues a call that never returns; it must not fire on the seconds an
++    /// AudioUnit start takes under load (lean run A_N19: "prepare took more than 2s", then the
++    /// guest's queue-state storm), and it must stay below the launcher's 10 s guest timeout.
++    #[test]
++    fn control_deadline_leaves_room_for_a_loaded_hal() {
++        assert!(CTL_DEADLINE >= Duration::from_secs(5));
++        assert!(CTL_DEADLINE < Duration::from_secs(10));
++    }
++
+     /// Queued I/O is failed with IO_ERR when the pump stops making progress, so the guest's
+     /// queues drain. (Before: nothing completed it; the guest kept "invalid I/O queue state"
+     /// for ever.)
+-- 
+2.39.5 (Apple Git-154)
+

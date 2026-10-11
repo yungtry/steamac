@@ -2,7 +2,7 @@ import AppKit
 import Darwin
 import QuartzCore
 
-/// "Still working" indicator (Settings > General). Shown after `ready`, never during the
+/// "Loading…" indicator (Settings > General). Shown after `ready`, never during the
 /// boot/shutdown overlay, when the guest sends no GPU work for `idleThreshold` while a game has
 /// focus (`focus game <appid>`; the idle Steam UI legitimately sends none for minutes), or —
 /// whatever has focus — when the guest's heartbeat has also stopped for `heartbeatTimeout`.
@@ -17,7 +17,7 @@ import QuartzCore
 /// The idle window starts at the latest of: last GPU work, gate opening (overlay gone, setting
 /// on), the game getting focus — so stale idle time never fires at once. The wording comes from
 /// the guest agent's heartbeat (`alive <uptime_ms> <loadavg1>` once a second over fx.progress)
-/// and this process's CPU time (vCPU threads included): alive → "Still working…" + CPU, no
+/// and this process's CPU time (vCPU threads included): alive → "Loading…" + CPU, no
 /// heartbeat for `heartbeatTimeout` → "SteamOS is not responding…". With perf stats on it also
 /// logs the counter rates and the longest idle stretch every 5 s. Main thread only.
 final class StallMonitor {
@@ -205,11 +205,13 @@ final class StallMonitor {
 
     private func text(now: CFTimeInterval, idle: CFTimeInterval) -> (String, String) {
         if notResponding() {
-            return ("SteamOS is not responding…", "waiting (\(Int(idle)) s)")
+            return (String(localized: "SteamOS is not responding…"), String(localized: "waiting (\(Int(idle)) s)"))
         }
-        let title = "Still working — loading or compiling shaders…"
-        var detail = "VM CPU \(String(format: "%.1f", currentCPU())) cores"
-        if lastAlive > 0 { detail += " · guest alive" }
+        let title = String(localized: "Loading…")
+        let cores = String(format: "%.1f", currentCPU())
+        let detail = lastAlive > 0
+            ? String(localized: "VM CPU \(cores) cores · guest alive")
+            : String(localized: "VM CPU \(cores) cores")
         return (title, detail)
     }
 
@@ -263,10 +265,10 @@ final class StallMonitor {
         guard now - perfStart >= StallMonitor.perfPeriod - StallMonitor.tick / 2 else { return }
         let dt = now - perfStart
         if let c, let p = perfCounters {
-            log(String(format: "perf: gpu ctrl/s=%.1f ring/s=%.1f longest-idle=%.2f s",
+            perfLog(String(format: "perf: gpu ctrl/s=%.1f ring/s=%.1f longest-idle=%.2f s",
                        Double(c.ctrl &- p.ctrl) / dt, Double(c.ring &- p.ring) / dt, perfLongestIdle))
         } else {
-            log("perf: gpu counters unavailable")
+            perfLog("perf: gpu counters unavailable")
         }
         perfStart = now
         perfCounters = c
@@ -433,7 +435,7 @@ final class StallIndicatorView: NSView {
     }
 
     private var linkString: NSAttributedString {
-        NSAttributedString(string: "Report…", attributes: [
+        NSAttributedString(string: String(localized: "Report…", comment: "Link to report an unresponsive VM to the developer"), attributes: [
             .font: NSFont.systemFont(ofSize: 13 * scaleFactor, weight: .semibold),
             .foregroundColor: OverlayView.color(0x66c0f4),
             .underlineStyle: NSUnderlineStyle.single.rawValue])

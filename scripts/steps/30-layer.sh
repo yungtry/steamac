@@ -30,6 +30,22 @@ else
     exit 1
 fi
 
+# DXMT for the launcher's "Graphics path: DXMT" (steam-gfx-path): DXMT's PE dlls (Wine builtins:
+# d3d11, dxgi, d3d10core, winemetal) and the wmtr guest client winemetal.so, staged in /work/out/dxmt by
+# wmtr/ (make dxmt-payload). Optional: without it the layer offers only the Vulkan path.
+DXMT=/work/out/dxmt
+if [[ -f $DXMT/x86_64-unix/winemetal.so ]]; then
+    install -d "$ST/usr/lib/steamac/dxmt/x86_64-windows" "$ST/usr/lib/steamac/dxmt/x86_64-unix"
+    for f in d3d11 dxgi d3d10core winemetal; do
+        install -m 0644 "$DXMT/x86_64-windows/$f.dll" "$ST/usr/lib/steamac/dxmt/x86_64-windows/$f.dll"
+    done
+    install -m 0644 "$DXMT/x86_64-unix/winemetal.so" "$ST/usr/lib/steamac/dxmt/x86_64-unix/winemetal.so"
+    dxmt_info=$(cd "$DXMT" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+    echo "[layer] included DXMT from $DXMT ($dxmt_info)"
+else
+    dxmt_info=ABSENT
+fi
+
 AGENT=/work/cache/progress-agent/fx-progress-agent
 [[ -x $AGENT ]] || { echo "[layer] $AGENT missing: run step 25 (scripts/build-image.sh layer does)" >&2; exit 1; }
 install -m 0755 "$AGENT" "$ST/usr/lib/steamac/fx-progress-agent"
@@ -63,7 +79,8 @@ grep -q 'fx-progress-agent sleep suspend$' "$ST/usr/lib/systemd/system/systemd-s
 for f in usr/bin/splctl usr/lib/rauc/post-install.sh usr/lib/steamac/kernelsetup.sh \
          usr/lib/steamac/rauc-shims/steamos-chroot usr/lib/steamac/steam-gfx-env \
          usr/lib/steamac/steam-shader-defaults usr/lib/steamac/steam-client \
-         usr/lib/steamac/nested-desktop usr/lib/steamac/desktop-bin/kwin_wayland_wrapper \
+         usr/lib/steamac/nested-desktop usr/lib/steamac/steam-gfx-path usr/lib/steamac/steam-frame-latency \
+         usr/lib/steamac/desktop-bin/kwin_wayland_wrapper \
          usr/lib/steamac/desktop-bin/steamosctl usr/lib/steamos/gamescope-session; do
     [[ -x $ST/$f ]] || { echo "[layer] $f missing or not executable" >&2; exit 1; }
     bash -n "$ST/$f"
@@ -76,11 +93,16 @@ grep -q 'ExecStartPre=/usr/lib/steamac/steam-client' "$ST/usr/lib/systemd/user/s
     && grep -q 'ExecStartPost=/usr/lib/steamac/steam-client --watch' "$ST/usr/lib/systemd/user/steam.service.d/50-steamac.conf" \
     || { echo "[layer] steam.service client setup or watcher missing" >&2; exit 1; }
 ls "$ST"/usr/lib/steamac/masks.d/*.list >/dev/null
+grep -q 'ExecStartPre=-/usr/lib/steamac/steam-gfx-path' "$ST/usr/lib/systemd/user/steam.service.d/50-steamac.conf" \
+    && [[ -L $ST/usr/lib/systemd/user/gamescope-session.target.wants/steamac-gfx-path.service ]] \
+    || { echo "[layer] steam-gfx-path (steam.service ExecStartPre, steamac-gfx-path.service) missing" >&2; exit 1; }
+grep -q 'ExecStartPre=-/usr/lib/steamac/steam-frame-latency' "$ST/usr/lib/systemd/user/steam.service.d/50-steamac.conf" \
+    || { echo "[layer] steam-frame-latency (steam.service ExecStartPre) missing" >&2; exit 1; }
 
 # layer-release: content hash (excluding itself) so a boot log identifies the layer.
 tree_hash=$(cd "$ST" && find usr -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
 cat > "$ST/usr/lib/steamac/layer-release" <<EOF
-steamac-layer content=$tree_hash rootfs-pin=$STEAMOS_BUILDID venus=$venus_info
+steamac-layer content=$tree_hash rootfs-pin=$STEAMOS_BUILDID venus=$venus_info dxmt=$dxmt_info
 EOF
 
 # Directory/file modes come from the repo checkout; normalise and make root-owned.

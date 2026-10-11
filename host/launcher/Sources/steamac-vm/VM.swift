@@ -97,9 +97,11 @@ final class VM {
 
         // GPU: Venus only (no virgl GL), host-visible shm window for blobs. virglrenderer (in this
         // process) opens the Vulkan driver named by VKR_VULKAN_DRIVER (its patch 0013).
+        Self.applyGraphicsEnv(o)
         setenv("VKR_VULKAN_DRIVER", "@rpath/" + o.vulkanDriver.library, 1)
         setenv("VKR_GPU_BUDGET_MIB", String(o.gpuBudgetMiB), 1)
         OverlayView.vulkanDriver = o.vulkanDriver
+        OverlayView.graphicsPath = o.graphicsPath
         log("gpu: Venus → \(o.vulkanDriver.name), \(o.gpuBudgetMiB) MiB advertised memory budget")
         let flags = o.gpuFlags ?? (STEAMAC_VIRGL_VENUS | STEAMAC_VIRGL_NO_VIRGL)
         try krun("krun_set_gpu_options2", krun_set_gpu_options2(ctx, flags, UInt64(o.shmMiB) << 20))
@@ -131,6 +133,21 @@ final class VM {
         // macOS/aarch64: an eventfd wired to libkrun's gpio-keys device (graceful shutdown key).
         shutdownFd = krun_get_shutdown_eventfd(ctx)
         if shutdownFd < 0 { log("warning: krun_get_shutdown_eventfd: \(shutdownFd)"); shutdownFd = -1 }
+    }
+
+    /// Graphics path (Settings > Advanced): DXMT asks libkrun (patch 0021) for the wmtr virtio-gpu context,
+    /// whose host side is libwmtr_host.dylib in the app's Frameworks; the game's CAMetalLayer goes on top
+    /// of the VM view (WMTR_PRESENT=overlay). Vulkan clears all of it, also when inherited from a shell.
+    static func applyGraphicsEnv(_ o: Options) {
+        if o.graphicsPath == .dxmt, let lib = LauncherSettings.GraphicsPath.hostLibraryPath {
+            setenv("STEAMAC_WMTR", "1", 1)
+            setenv("STEAMAC_WMTR_LIB", lib, 1)
+            setenv("WMTR_PRESENT", "overlay", 1)
+            log("gpu: graphics path DXMT (wmtr context, \(lib))")
+        } else {
+            for k in ["STEAMAC_WMTR", "STEAMAC_WMTR_LIB", "WMTR_PRESENT"] { unsetenv(k) }
+            log("gpu: graphics path Vulkan")
+        }
     }
 
     /// A Finder launch starts with a soft RLIMIT_NOFILE of 256. virglrenderer runs in this process
