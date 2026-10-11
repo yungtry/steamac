@@ -1,0 +1,119 @@
+From a3e157d633080129593b604123ccb96a28d93597 Mon Sep 17 00:00:00 2001
+From: build <build@invalid>
+Date: Sun, 11 Oct 2026 21:16:14 +0300
+Subject: [PATCH] Signals: give the interrupted code its InSyscallInfo back on
+ rt_sigreturn
+
+InSyscallInfo tells a host signal handler which guest registers are already
+spilled to the frame (the lower 16 bits are the SpillSRA ignore mask). A guest
+rt_sigreturn is itself a syscall, so the dispatcher sets it to 0xFFFF (every
+register spilled) before the C++ handler traps into RestoreThreadState. Only the
+path for a handler that changed RIP reset it. When RIP was unchanged and the
+signal had interrupted JIT code, RestoreThreadState put the host registers back
+and resumed the JIT block with InSyscallInfo still 0xFFFF, while the guest
+registers were live in host registers, until that thread's next syscall.
+
+In that window every SpillSRA skips all registers:
+- a nested signal hands the guest handler the stale register values in the
+  frame (Wine's usr1_handler decides from that ESP whether the thread is
+  inside a syscall);
+- an SMC fault that re-executes the current block as a single instruction
+  (SyscallsSMCTracking) spills nothing and makes the dispatcher refill every
+  register from the stale frame, so the guest continues with old values.
+
+Ubisoft Connect (32-bit upc.exe, run by the i386 Wine) makes the window wide:
+its protector reads the context of its threads all the time, which costs each
+thread a SIGUSR1 every few milliseconds, and its code shares pages with data it
+writes. On thread UPC_Http, in the gnutls/nettle/hogweed unix calls of the TLS
+handshake, the guest register state broke (PLT jumps through a wrong %ebx, a
+jump to 0xfffffd34, GCM counter blocks written past the stack top), and the
+launcher stopped at "Looking for patches" with "Certificate verification ...
+failed", schan_DecryptMessage c0000005 or SEC_E_INTERNAL_ERROR. Instrumented:
+41 of ~13k SIGUSR1 deliveries in one run hit JIT code with InSyscallInfo 0xFFFF,
+and the fatal SIGSEGV did too; with this change none do over three runs (65k
+signals), and the launcher self-updates (165.0 to 174.1), logs in and launches
+the game.
+
+RestoreThreadState now always restores the value the interrupted code had: the
+cleared one for a syscall handler (unchanged), the one saved on delivery for JIT
+code, 0 otherwise. The paths for a changed RIP abandon the interrupted code and
+refill every register from the frame at the dispatcher top, so they now set 0
+instead of the delivery value (which could be the mask of an in-JIT syscall op).
+Pause/resume (TYPE_PAUSE) is left as it was.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../LinuxSyscalls/SignalDelegator.cpp            | 16 +++++++++++++---
+ .../SignalDelegator/GuestFramesManagement.cpp    | 15 +++++++++------
+ 2 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
+index 7721996f4..1f88d65e9 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
+@@ -264,9 +264,19 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
+ 
+   // Restore host state
+   ArchHelpers::Context::RestoreContext(ucontext, Context);
+-  if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_SYSCALLINFO_CLEARED) {
+-    // Back in the syscall handler the guest signal interrupted.
+-    Thread->CurrentFrame->InSyscallInfo = Context->ClearedSyscallInfo;
++  if (Type != RestoreType::TYPE_PAUSE) {
++    // The interrupted code gets back the InSyscallInfo it had when the signal arrived. A guest rt_sigreturn is itself a
++    // syscall, so the dispatcher has just set InSyscallInfo to 0xFFFF (every register spilled) for it; left in place, the
++    // JIT code we return to would run with that stale value until its next syscall, and every SpillSRA in between (a
++    // nested signal, an SMC fault that re-executes the block) would skip all registers: the guest handler then sees
++    // stale registers, and the SMC path reloads them into the JIT.
++    if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_SYSCALLINFO_CLEARED) {
++      // Back in the syscall handler the guest signal interrupted.
++      Thread->CurrentFrame->InSyscallInfo = Context->ClearedSyscallInfo;
++    } else {
++      // JIT code (the value saved on delivery) or code that was not in a syscall (0).
++      Thread->CurrentFrame->InSyscallInfo = Context->InSyscallInfo;
++    }
+   }
+ 
+   {
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
+index 4c91eb220..91b527d43 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
+@@ -172,8 +172,9 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
+   // If the guest modified the RIP then we need to take special precautions here
+   if (Context->OriginalRIP != guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_RIP] || Context->FaultToTopAndGeneratedException) {
+ 
+-    // Restore previous `InSyscallInfo` structure.
+-    Frame->InSyscallInfo = Context->InSyscallInfo;
++    // The interrupted code is abandoned and the dispatcher refills every register from the frame: no register is
++    // spilled for a syscall any more.
++    Frame->InSyscallInfo = 0;
+ 
+     // Hack! Go back to the top of the dispatcher top
+     // This is only safe inside the JIT rather than anything outside of it
+@@ -256,8 +257,9 @@ void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thre
+   SigFrame_i32* guest_uctx = reinterpret_cast<SigFrame_i32*>(Context->UContextLocation);
+   // If the guest modified the RIP then we need to take special precautions here
+   if (Context->OriginalRIP != guest_uctx->sc.ip || Context->FaultToTopAndGeneratedException) {
+-    // Restore previous `InSyscallInfo` structure.
+-    Frame->InSyscallInfo = Context->InSyscallInfo;
++    // The interrupted code is abandoned and the dispatcher refills every register from the frame: no register is
++    // spilled for a syscall any more.
++    Frame->InSyscallInfo = 0;
+ 
+     // Hack! Go back to the top of the dispatcher top
+     // This is only safe inside the JIT rather than anything outside of it
+@@ -342,8 +344,9 @@ void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Th
+   // If the guest modified the RIP then we need to take special precautions here
+   if (Context->OriginalRIP != guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EIP] || Context->FaultToTopAndGeneratedException) {
+ 
+-    // Restore previous `InSyscallInfo` structure.
+-    Frame->InSyscallInfo = Context->InSyscallInfo;
++    // The interrupted code is abandoned and the dispatcher refills every register from the frame: no register is
++    // spilled for a syscall any more.
++    Frame->InSyscallInfo = 0;
+ 
+     // Hack! Go back to the top of the dispatcher top
+     // This is only safe inside the JIT rather than anything outside of it
+-- 
+2.44.0
+

@@ -46,6 +46,9 @@ in the research repo.
 | 0011–0020 | kernel-fidelity gaps a title or Wine can observe (debug registers, `/proc/<pid>/status`, `arch_prctl`, regsets, `restart_syscall`, the signal frame) |
 | 0022, 0023, 0025, 0026 | what a second title's anti-tamper bootstrapper observes: host stack per SIGSYS trap, reads of FEX's own shadow-stack guard pages, the single-step trap after `iretq`, a thread exiting on its signal alt stack |
 | 0027 | serves a tracee's `/proc/<pid>/maps` without FEX's own mappings above the x86-64 user address limit, so the EAC launcher resolves the guest's `libc.so.6`, not FEX's aarch64 one |
+| 0028 | code pages the guest makes writable and executable stay writable for other processes (`NtWriteVirtualMemory` hooks) |
+| 0029 | `rt_sigreturn` restores the interrupted code's syscall-spill state, so frequent signals no longer leave the JIT with stale registers (Ubisoft Connect's TLS thread) |
+| 0030 | the tracer no longer sees FEX's own `SIGBUS` stops for unaligned atomics, so the EAC launcher does not give up with `Unexpected error. (#2)` while its client initialises in the game (The Division 2) |
 | 0003, 0005, 0006, 0009, 0024 | diagnostics and profiling only — not fixes |
 
 Required for VRChat: 0001 (to inject at all), 0002 (so the client finishes loading) and 0007 (to avoid Photon
