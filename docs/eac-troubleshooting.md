@@ -14,6 +14,7 @@ Never attach a debugger, `strace` or `perf` to the running game: EAC reports it.
 | symptom | check |
 |---|---|
 | launcher stops at `Starting Wine module mapping`, or the result is not `301` | the patched FEX is probably not installed: `sh install-fex-tool.sh status`. Valve's FEX-2607 fails EAC ([eac-how-it-works.md](eac-how-it-works.md)) |
+| `Starting Wine module mapping`, then `Launcher finished with: 210, 'Unexpected error. (#1)'` about 3 s later, with the patched FEX installed | the FEX build predates patch 0027: the current EAC launcher module injects into the guest before its libc is loaded and picked FEX's own aarch64 `libc.so.6` from `/proc/<pid>/maps`. Re-run `sh build-fex.sh` (it applies only the missing patches) and `sh install-fex-tool.sh` |
 | worked before, fails after a Steam update | the update replaced the FEX tool with Valve's build; re-run `sh install-fex-tool.sh` |
 | the Android build starts (or the game does not use Proton) | set the game's compatibility tool to Proton Experimental and let Steam install the Windows depot |
 | EAC runtime errors at start | install **Proton EasyAntiCheat Runtime** (1826330) and check `EAC_LAUNCHERDIR` / `PROTON_EAC_RUNTIME` in the launch options |

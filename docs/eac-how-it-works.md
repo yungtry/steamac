@@ -45,6 +45,7 @@ in the research repo.
 | 0010 | the emulated seccomp/SIGSYS path (`SECCOMP_RET_TRAP`): the handler's `rt_sigreturn` resumes past the trapped syscall instead of re-running it. It does not fix Wine's separate `install_bpf` / `sigsys_handler` livelock, which is upstream Wine (Proton #9827/#9164) |
 | 0011–0020 | kernel-fidelity gaps a title or Wine can observe (debug registers, `/proc/<pid>/status`, `arch_prctl`, regsets, `restart_syscall`, the signal frame) |
 | 0022, 0023, 0025, 0026 | what a second title's anti-tamper bootstrapper observes: host stack per SIGSYS trap, reads of FEX's own shadow-stack guard pages, the single-step trap after `iretq`, a thread exiting on its signal alt stack |
+| 0027 | serves a tracee's `/proc/<pid>/maps` without FEX's own mappings above the x86-64 user address limit, so the EAC launcher resolves the guest's `libc.so.6`, not FEX's aarch64 one |
 | 0003, 0005, 0006, 0009, 0024 | diagnostics and profiling only — not fixes |
 
 Required for VRChat: 0001 (to inject at all), 0002 (so the client finishes loading) and 0007 (to avoid Photon

@@ -25,13 +25,15 @@ cd "$SRC"
 TAGSHA=$(git rev-parse "$TAG^{commit}")
 [ "$TAGSHA" = "$BASE" ] || { echo "$TAG is $TAGSHA, expected $BASE" >&2; exit 1; }
 
-# Apply the patch series once; a re-run must find exactly the series already applied and nothing else.
+# Apply the patch series once; a re-run must find the series (or an older, shorter build of it) and nothing else.
+# A tree built before patches were added carries a prefix of the series: apply only the patches it lacks.
 ONTOP=$(git rev-list --count "$BASE"..HEAD)
-if [ "$ONTOP" -eq 0 ]; then
-  git -c user.name=build -c user.email=build@invalid am "$PATCHES"/*.patch
-elif [ "$ONTOP" -ne "$NPATCH" ]; then
-  echo "$(git rev-parse --short HEAD) has $ONTOP commits on top of $BASE; expected 0 or $NPATCH" >&2
+if [ "$ONTOP" -gt "$NPATCH" ]; then
+  echo "$(git rev-parse --short HEAD) has $ONTOP commits on top of $BASE; expected at most $NPATCH" >&2
   exit 1
+elif [ "$ONTOP" -lt "$NPATCH" ]; then
+  shift "$ONTOP"
+  git -c user.name=build -c user.email=build@invalid am "$@"
 fi
 
 # Release Steam-mode build: no tests, thunks or FEXConfig, native CPU tuning, module scanning off for clang 19.
