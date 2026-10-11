@@ -1,0 +1,387 @@
+From cf145b9841ce2c70e4d7ab8286d65e2d2a0090e6 Mon Sep 17 00:00:00 2001
+From: steamac <steamac@local>
+Date: Sun, 11 Oct 2026 16:00:00 +0300
+Subject: [PATCH] kk: R32G32B32 uniform texel buffers through R32 texture
+ buffers
+
+Metal has no 96-bit pixel format, so kk_vf_formats has no entry for
+R32G32B32_{FLOAT,UINT,SINT} and kk_get_va_format returns NULL for them.
+kk_CreateBufferView never checked that:
+
+   const struct kk_va_format *supported_format = kk_get_va_format(p_format);
+   /* If we reached here, we support reading at least */
+   if (supported_format->texel_buffer.write)
+
+and read texel_buffer through NULL (offset 0xa). The buffer format
+features of these formats were 0, so a valid application never got there,
+but vkd3d-proton creates the Vulkan view of a typed buffer SRV with the
+SRV's format without checking the format's features (vkd3d_create_vk_
+buffer_view), and Windows GPUs support R32G32B32 typed buffers. Halo
+Infinite creates DXGI_FORMAT_R32G32B32_FLOAT buffer SRVs after its
+startup: under steamac the VMM died with EXC_BAD_ACCESS at 0xa in
+kk_CreateBufferView on a vkr-ring thread, every launch (5 crash reports
+in one day). Failing the view instead would leave vkd3d-proton writing a
+null descriptor, so the shader would read zeros.
+
+R32G32B32 views are now R32 texture buffers three texels wide per view
+texel, read component by component:
+
+ * kk_CreateBufferView makes the Metal texture with the R32 format of the
+   view's component type, width 3 * elements + texel_offset, read-only;
+   texel_offset counts R32 texels (any 4-byte multiple: single texel
+   alignment for three-component formats is one component). Views of
+   sparse buffers work the same way, their pages and residency in 4-byte
+   texels.
+ * The texel buffer descriptor flags such views with KK_TEXEL_BUFFER_RGB32,
+   the top bit of texel_offset (offsets are below 2^16 texels).
+ * Texel fetches (txf) of texel buffers scale the coordinate by 3 for
+   flagged views, and in a branch on the flag fetch green and blue from
+   the next two texels and return (r, g, b, 1). Size queries divide by 3.
+   A sparse fetch takes the residency of its first and last component (a
+   12-byte texel can straddle two 64 KiB pages). Image intrinsics mask
+   the flag off (no storage texel buffer feature for these formats).
+ * The buffer format features of R32G32B32 formats include
+   UNIFORM_TEXEL_BUFFER (not STORAGE_TEXEL_BUFFER), so D3D12 apps also see
+   the typed buffer support through CheckFeatureSupport.
+
+A texel buffer view of any other format KosmicKrisp has no texel buffer
+support for now fails with VK_ERROR_FORMAT_NOT_SUPPORTED instead of
+crashing the VMM.
+
+Every texel buffer fetch pays one descriptor bit test and two selects; the
+two extra fetches run only for R32G32B32 views. A view of more than
+maxTexelBufferElements / 3 R32G32B32 texels exceeds Metal's texture
+buffer width and fails to create (VK_ERROR_OUT_OF_DEVICE_MEMORY).
+
+Test: host/kosmickrisp/tests/rgb32-texel-buffer.c (SFLOAT/UINT/SINT views
+at 20/8/28-byte offsets, an R32_SFLOAT view as the unchanged path, every
+component, textureSize and the format features; before this patch it
+faults at kk_CreateBufferView+80, address 0xa, like the VMM).
+---
+ src/kosmickrisp/vulkan/kk_buffer_view.c       |  43 ++++++-
+ src/kosmickrisp/vulkan/kk_buffer_view.h       |   6 +
+ src/kosmickrisp/vulkan/kk_descriptor_set.c    |   3 +-
+ src/kosmickrisp/vulkan/kk_descriptor_types.h  |   8 ++
+ .../vulkan/kk_nir_lower_descriptors.c         | 116 +++++++++++++++---
+ 5 files changed, 158 insertions(+), 18 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index 5674962..09dd77e 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -19,8 +19,24 @@
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/mtl_format.h"
+ 
++#include "vk_enum_to_str.h"
+ #include "vk_format.h"
+ 
++enum pipe_format
++kk_texel_buffer_rgb32_component(enum pipe_format format)
++{
++   switch (format) {
++   case PIPE_FORMAT_R32G32B32_FLOAT:
++      return PIPE_FORMAT_R32_FLOAT;
++   case PIPE_FORMAT_R32G32B32_UINT:
++      return PIPE_FORMAT_R32_UINT;
++   case PIPE_FORMAT_R32G32B32_SINT:
++      return PIPE_FORMAT_R32_SINT;
++   default:
++      return PIPE_FORMAT_NONE;
++   }
++}
++
+ VkFormatFeatureFlags2
+ kk_get_buffer_format_features(struct kk_physical_device *pdev,
+                               VkFormat vk_format)
+@@ -45,6 +61,9 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev,
+       /* Only these formats allow atomics for texel buffers */
+       if (vk_format == VK_FORMAT_R32_UINT || vk_format == VK_FORMAT_R32_SINT)
+          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
++   } else if (kk_texel_buffer_rgb32_component(p_format) != PIPE_FORMAT_NONE) {
++      /* Read through an R32 texture buffer (kk_CreateBufferView) */
++      features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
+    }
+ 
+    if (kk_vbo_supports_format(p_format))
+@@ -64,12 +83,29 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+    if (!view)
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
++   /* Metal has no 96-bit pixel formats: R32G32B32 views are R32 texture
++    * buffers of three texels per view texel, read by shaders component by
++    * component (KK_TEXEL_BUFFER_RGB32, kk_nir_lower_descriptors.c).
++    * vkd3d-proton creates them for typed buffer SRVs of R32G32B32 DXGI
++    * formats without checking the format's features.
++    */
+    enum pipe_format p_format = vk_format_to_pipe_format(view->vk.format);
++   const enum pipe_format rgb32_component =
++      kk_texel_buffer_rgb32_component(p_format);
++   const bool rgb32 = rgb32_component != PIPE_FORMAT_NONE;
++   if (rgb32)
++      p_format = rgb32_component;
+    const struct kk_va_format *supported_format = kk_get_va_format(p_format);
++   if (!supported_format) {
++      const VkFormat format = view->vk.format;
++      vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
++      return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
++                       "no texel buffer view of %s",
++                       vk_Format_to_str(format));
++   }
+ 
+-   /* If we reached here, we support reading at least */
+    enum mtl_texture_usage usage = MTL_TEXTURE_USAGE_SHADER_READ;
+-   if (supported_format->texel_buffer.write)
++   if (supported_format->texel_buffer.write && !rgb32)
+       usage |= MTL_TEXTURE_USAGE_SHADER_WRITE;
+ 
+    /* Only these formats allow atomics for texel buffers */
+@@ -99,9 +135,10 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+       texture_offset = mtl_offset;
+    }
+    view->texel_offset = (mtl_offset - texture_offset) / texel_B;
++   view->rgb32 = rgb32;
+ 
+    struct kk_image_layout layout = {
+-      .width_px = view->vk.elements + view->texel_offset,
++      .width_px = view->vk.elements * (rgb32 ? 3u : 1u) + view->texel_offset,
+       .height_px = 1u,
+       .depth_px = 1u,
+       .layers = 1u,
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.h b/src/kosmickrisp/vulkan/kk_buffer_view.h
+index 3313328..1b07e85 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.h
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.h
+@@ -14,6 +14,7 @@
+ 
+ #include "vk_buffer_view.h"
+ 
++#include "util/format/u_formats.h"
+ #include "util/list.h"
+ 
+ struct kk_physical_device;
+@@ -21,6 +22,8 @@ struct kk_physical_device;
+ VkFormatFeatureFlags2
+ kk_get_buffer_format_features(struct kk_physical_device *pdev, VkFormat format);
+ 
++enum pipe_format kk_texel_buffer_rgb32_component(enum pipe_format format);
++
+ struct kk_buffer_view {
+    struct vk_buffer_view vk;
+    mtl_texture *mtl_texel_buffer_handle;
+@@ -28,6 +31,9 @@ struct kk_buffer_view {
+    /* Texels from the start of the Metal texture (aligned down) to the view
+     * (struct kk_texel_buffer_descriptor). */
+    uint32_t texel_offset;
++   /* An R32G32B32 view: its Metal texture is R32, three texels per view
++    * texel, and texel_offset counts R32 texels (KK_TEXEL_BUFFER_RGB32). */
++   bool rgb32;
+ 
+    /* Views of sparse buffers are placement sparse texture buffers whose pages
+     * follow the buffer's sparse_page_count pages from sparse_first_page
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_set.c b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+index 7c8e91b..1d908aa 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ b/src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -268,7 +268,8 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+       assert(view->texel_buffer_gpu_id);
+ 
+       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
+-      desc.texel_offset = view->texel_offset;
++      desc.texel_offset =
++         view->texel_offset | (view->rgb32 ? KK_TEXEL_BUFFER_RGB32 : 0u);
+       desc.residency_gpu_resource_id = view->residency_gpu_id;
+       desc.residency_first_page = view->sparse_first_page;
+       desc.residency_page_shift = view->residency_page_shift;
+diff --git a/src/kosmickrisp/vulkan/kk_descriptor_types.h b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+index 6d01dec..9b9e03c 100644
+--- a/src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ b/src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -82,7 +82,15 @@ static_assert(sizeof(struct kk_storage_image_descriptor) == 16,
+  * texture is in buffer page
+  * min(residency_first_page + (x >> residency_page_shift), residency_last_page).
+  * residency_gpu_resource_id is 0 for other views (always resident).
++ *
++ * R32G32B32 views (Metal has no 96-bit pixel formats) set
++ * KK_TEXEL_BUFFER_RGB32 in texel_offset: their Metal texture is R32 with
++ * three texels per view texel, and texel_offset counts R32 texels. Texel
++ * fetches read the three components and return (r, g, b, 1); size queries
++ * divide by three.
+  */
++#define KK_TEXEL_BUFFER_RGB32 (1u << 31)
++
+ struct kk_texel_buffer_descriptor {
+    uint64_t image_gpu_resource_id;
+    uint32_t texel_offset;
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 00eec64..efc9473 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -425,6 +425,72 @@ and_sparse_residency(nir_builder *b, nir_instr *instr, nir_def *def,
+    nir_def_rewrite_uses_after(def, nir_vector_insert_imm(b, def, code, code_comp));
+ }
+ 
++/* Texel buffer descriptor's texel offset without KK_TEXEL_BUFFER_RGB32, and
++ * that flag (struct kk_texel_buffer_descriptor). */
++static nir_def *
++load_texel_buffer_offset(nir_builder *b, nir_deref_instr *deref,
++                         unsigned plane_offset_B, nir_def **rgb32,
++                         const struct lower_descriptors_ctx *ctx)
++{
++   nir_def *desc = load_resource_deref_desc(
++      b, 1, 32, deref,
++      plane_offset_B + offsetof(struct kk_texel_buffer_descriptor, texel_offset),
++      ctx);
++   if (rgb32)
++      *rgb32 = nir_ine_imm(b, nir_iand_imm(b, desc, KK_TEXEL_BUFFER_RGB32), 0);
++   return nir_iand_imm(b, desc, ~KK_TEXEL_BUFFER_RGB32);
++}
++
++/* A texel fetch of an R32G32B32 view (KK_TEXEL_BUFFER_RGB32) fetched the red
++ * component from R32 texel x; fetch green and blue from the next two texels
++ * and return (r, g, b, 1). The fetch is unchanged for other views. */
++static void
++lower_rgb32_texel_fetch(nir_builder *b, nir_tex_instr *tex, nir_def *x,
++                        nir_def *rgb32)
++{
++   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
++   nir_def *coord = tex->src[coord_idx].src.ssa;
++   nir_def *def = &tex->def;
++   const unsigned comps = def->num_components - (tex->is_sparse ? 1u : 0u);
++
++   /* The fetch's components, read in its block: the if below splits it, and
++    * every use of def after these reads is rewritten. */
++   b->cursor = nir_after_instr(&tex->instr);
++   nir_def *chans[NIR_MAX_VEC_COMPONENTS];
++   for (unsigned i = 0; i < def->num_components; i++)
++      chans[i] = nir_channel(b, def, i);
++   nir_instr *last_read = nir_def_instr(chans[def->num_components - 1]);
++
++   nir_def *zero = nir_imm_zero(b, 1, def->bit_size);
++   nir_def *one = nir_alu_type_get_base_type(tex->dest_type) == nir_type_float
++                     ? nir_imm_floatN_t(b, 1.0, def->bit_size)
++                     : nir_imm_intN_t(b, 1, def->bit_size);
++   nir_def *gb[2];
++   nir_push_if(b, rgb32);
++   for (unsigned i = 0; i < 2; i++) {
++      nir_def *fetch_coord =
++         nir_vector_insert_imm(b, coord, nir_iadd_imm(b, x, i + 1), 0);
++      nir_tex_instr *fetch =
++         nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
++      nir_builder_instr_insert(b, &fetch->instr);
++      nir_src_rewrite(&fetch->src[coord_idx].src, fetch_coord);
++      gb[i] = nir_channel(b, &fetch->def, 0);
++   }
++   nir_pop_if(b, NULL);
++
++   /* The phis first in the block after the if */
++   nir_def *rgba[4] = {
++      chans[0],
++      nir_if_phi(b, gb[0], zero),
++      nir_if_phi(b, gb[1], zero),
++      one,
++   };
++   for (unsigned i = 0; i < MIN2(comps, 4); i++)
++      chans[i] = nir_bcsel(b, rgb32, rgba[i], chans[i]);
++   nir_def_rewrite_uses_after_instr(def, nir_vec(b, chans, def->num_components),
++                                    last_read);
++}
++
+ /* Replaces the residency code (last component, read as old_code right after
+  * def) of a sparse load's def with new_code, at the cursor: all other uses of
+  * def come after it (code emitted in between is in its own control flow). */
+@@ -527,9 +593,8 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
+     */
+    nir_def *texel_offset = NULL, *residency = NULL;
+    if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF) {
+-      texel_offset = load_resource_deref_desc(
+-         b, 1, 32, deref,
+-         offsetof(struct kk_texel_buffer_descriptor, texel_offset), ctx);
++      /* R32G32B32 views have no storage texel buffer feature */
++      texel_offset = load_texel_buffer_offset(b, deref, 0, NULL, ctx);
+       if (intr->intrinsic != nir_intrinsic_image_deref_size) {
+          nir_def *coord = intr->src[1].ssa;
+          nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
+@@ -912,6 +977,10 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+       return false;
+    }
+ 
++   /* Texel buffer fetches: the R32G32B32 view lowering and the residency of
++    * sparse ones, done once every source of the fetch is final. */
++   nir_def *buf_fetch_x = NULL, *buf_rgb32 = NULL, *buf_residency = NULL;
++
+    nir_def *plane_ssa = nir_steal_tex_src(tex, nir_tex_src_plane);
+    const uint32_t plane =
+       plane_ssa ? nir_src_as_uint(nir_src_for_ssa(plane_ssa)) : 0;
+@@ -1002,31 +1071,45 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+        * the view (struct kk_texel_buffer_descriptor).
+        */
+       if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+-         nir_def *texel_offset = load_resource_deref_desc(
+-            b, 1, 32, nir_src_as_deref(nir_src_for_ssa(texture)),
+-            plane_offset_B +
+-               offsetof(struct kk_texel_buffer_descriptor, texel_offset),
+-            ctx);
++         nir_def *rgb32;
++         nir_def *texel_offset = load_texel_buffer_offset(
++            b, nir_src_as_deref(nir_src_for_ssa(texture)), plane_offset_B,
++            &rgb32, ctx);
+          const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+          if (tex->op == nir_texop_txs) {
+             b->cursor = nir_after_instr(&tex->instr);
+             nir_def *size = &tex->def;
+             nir_def *x = nir_isub(b, nir_channel(b, size, 0),
+                                   nir_u2uN(b, texel_offset, size->bit_size));
++            x = nir_bcsel(b, rgb32, nir_udiv_imm(b, x, 3), x);
+             nir_def_rewrite_uses_after(size,
+                                        nir_vector_insert_imm(b, size, x, 0));
+             b->cursor = nir_before_instr(&tex->instr);
+          } else if (coord_idx >= 0) {
+             nir_def *coord = tex->src[coord_idx].src.ssa;
+-            nir_def *x = nir_iadd(b, nir_channel(b, coord, 0),
+-                                  nir_u2uN(b, texel_offset, coord->bit_size));
++            nir_def *x = nir_channel(b, coord, 0);
++            if (tex->op == nir_texop_txf)
++               x = nir_bcsel(b, rgb32, nir_imul_imm(b, x, 3), x);
++            x = nir_iadd(b, x, nir_u2uN(b, texel_offset, coord->bit_size));
+             nir_src_rewrite(&tex->src[coord_idx].src,
+                             nir_vector_insert_imm(b, coord, x, 0));
+             if (tex->is_sparse) {
+-               nir_def *residency = load_texel_buffer_residency(
+-                  b, nir_src_as_deref(nir_src_for_ssa(texture)), x, ctx);
+-               and_sparse_residency(b, &tex->instr, &tex->def, residency);
+-               b->cursor = nir_before_instr(&tex->instr);
++               /* An R32G32B32 texel may straddle two pages */
++               buf_residency = nir_iand(
++                  b,
++                  load_texel_buffer_residency(
++                     b, nir_src_as_deref(nir_src_for_ssa(texture)), x, ctx),
++                  load_texel_buffer_residency(
++                     b, nir_src_as_deref(nir_src_for_ssa(texture)),
++                     nir_iadd(b, x,
++                              nir_bcsel(b, rgb32,
++                                        nir_imm_intN_t(b, 2, x->bit_size),
++                                        nir_imm_intN_t(b, 0, x->bit_size))),
++                     ctx));
++            }
++            if (tex->op == nir_texop_txf) {
++               buf_fetch_x = x;
++               buf_rgb32 = rgb32;
+             }
+          }
+       }
+@@ -1067,6 +1150,11 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+       nir_tex_instr_add_src(tex, nir_tex_src_max_lod_kk, lod_max);
+    }
+ 
++   if (buf_fetch_x)
++      lower_rgb32_texel_fetch(b, tex, buf_fetch_x, buf_rgb32);
++   if (buf_residency)
++      and_sparse_residency(b, &tex->instr, &tex->def, buf_residency);
++
+    if (tex->is_sparse && tex->sampler_dim != GLSL_SAMPLER_DIM_BUF &&
+        tex->sampler_dim != GLSL_SAMPLER_DIM_MS && tex->op != nir_texop_txf_ms)
+       lower_sampled_view_residency(
+-- 
+2.54.0 (Apple Git-157)
+

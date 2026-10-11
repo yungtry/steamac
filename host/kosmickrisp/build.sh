@@ -170,6 +170,13 @@
 #              into gfx->pipe; make the flush and dispatch bails structural (command-buffer error, no dispatch
 #              without a render state) instead of asserts. Not yet live-verified: the recorded runs under
 #              MESA_KK_ASYNC_PIPELINES=2 predate this patch's build.
+#   0048       steamac: R32G32B32 uniform texel buffers. Metal has no 96-bit pixel format, kk_get_va_format returned
+#              NULL and kk_CreateBufferView read through it (EXC_BAD_ACCESS at 0xa on a vkr-ring thread: the VM
+#              died). vkd3d-proton creates typed buffer SRVs of R32G32B32 formats without checking the format's
+#              features (Halo Infinite, every launch). Such views are R32 texture buffers three texels per view
+#              texel, flagged in the descriptor (KK_TEXEL_BUFFER_RGB32); texel fetches read the three components
+#              and return (r, g, b, 1), size queries divide by 3; the formats report UNIFORM_TEXEL_BUFFER. Views
+#              of other unsupported formats fail with VK_ERROR_FORMAT_NOT_SUPPORTED. Test: tests/rgb32-texel-buffer.c.
 #
 # Two meson builds: (1) the host compiler tools mesa_clc + vtn_bindgen2 against Homebrew LLVM
 # (shared) and SPIRV-LLVM-Translator, installed into work/build/host-kosmickrisp/clc; (2) the driver
@@ -403,6 +410,7 @@ mv -f "$lib.tmp.$$" "$lib"
 	echo "  0042 = steamac: robustness fixes (XFB counter bounds, sparse container_of, minmax update-after-bind scan, sparse view underflow)"
 	echo "  0043 = steamac: drop a draw whose async render pipeline state failed instead of recording it with a NULL state"
 	echo "  0047 = steamac: gate the async draw on the program the draw actually uses (not the bound VS)"
+	echo "  0048 = steamac: R32G32B32 uniform texel buffers as R32 texture buffers; unsupported texel buffer formats fail, not crash"
 	echo
 	echo "Known gaps (host/moltenvk/repro/run.sh): transform feedback with strip geometry shaders and"
 	echo "the overflow counter (draft !44928)."
